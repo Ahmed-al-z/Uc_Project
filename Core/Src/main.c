@@ -126,6 +126,7 @@ void Start_Task_Storage(void const * argument);
 void Start_Task_Net_Broadcast(void const * argument); // Ex-Discovery
 void Start_Task_Net_Server(void const * argument);
 void Start_Task_Net_Client(void const * argument);
+void presence_broadcast(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -763,44 +764,98 @@ void Start_Task_Acquisition(void const * argument)
 
 
 /* 5. Tâche Broadcast (UDP) */
+/* 5. Tâche Broadcast (UDP) - STYLE "AMI" */
 void Start_Task_Net_Broadcast(void const * argument)
 {
-    struct udp_pcb *upcb;
-    struct pbuf *p;
-    const char *msg = "{\"id\": \"STM32_NODE\", \"status\": \"alive\"}";
-    ip_addr_t destAddr;
-    err_t err;
-
-    upcb = udp_new();
-    if (upcb == NULL) {
-        log_to_uart("ERR: UDP create failed");
-        for(;;) osDelay(1000);
+    /* 1. Attente du lien Ethernet */
+    log_to_uart("NET: Waiting for Link...");
+    while (!netif_is_up(&gnetif) || ip_addr_isany(&gnetif.ip_addr)) {
+        osDelay(500);
     }
 
-    /* Broadcast IP: 255.255.255.255 */
-    IP_ADDR4(&destAddr, 255, 255, 255, 255);
+    // Affichage IP une seule fois
+    char ip_txt[16];
+    ipaddr_ntoa_r(&gnetif.ip_addr, ip_txt, 16);
+    log_to_uart("NET: Ready! My IP is: %s", ip_txt);
 
     for(;;)
     {
-        p = pbuf_alloc(PBUF_TRANSPORT, strlen(msg), PBUF_RAM);
+        // Appel de la fonction séparée (comme ton ami)
+        send_presence_broadcast();
 
-        if (p != NULL)
-        {
-            pbuf_take(p, (char*)msg, strlen(msg));
-            err = udp_sendto(upcb, p, &destAddr, 12345);
-
-            if (err != ERR_OK) {
-                log_to_uart("ERR: UDP send failed %d", err);
-            }
-            pbuf_free(p);
-        }
-        else {
-            log_to_uart("ERR: Pbuf alloc failed");
-        }
-
-        osDelay(10000); // 10 secondes
+        // Délai de 1s pour les tests
+        osDelay(1000);
     }
 }
+
+
+/* USER CODE BEGIN 4 */
+
+/* Fonction inspirée du code de ton ami */
+/* Fonction inspirée du code de ton ami - VERSION CORRIGÉE ROUTAGE */
+void send_presence_broadcast(void)
+{
+    struct udp_pcb *pcb;
+    struct pbuf *p;
+    ip_addr_t dest_ip;
+    err_t err;
+    char msg[256];
+    char my_ip[16];
+
+    // 1. Création du PCB (Socket)
+    pcb = udp_new();
+    if (pcb == NULL) {
+        log_to_uart("ERR: UDP Create Fail");
+        return;
+    }
+
+    // 2. Définition de la cible
+    // VERIFIE BIEN QUE C'EST L'IP DE TON PC ACTUELLEMENT !
+    ipaddr_aton("169.254.143.38", &dest_ip);
+
+    // 3. Bind local
+    udp_bind(pcb, IP_ADDR_ANY, 0);
+
+    // 4. Préparation du JSON dynamique
+    ipaddr_ntoa_r(&gnetif.ip_addr, my_ip, 16);
+
+    snprintf(msg, sizeof(msg),
+        "{\n"
+        " \"type\": \"presence\",\n"
+        " \"id\": \"nucleo-moi\",\n"
+        " \"ip\": \"%s\",\n"
+        " \"timestamp\": \"%lu\"\n"
+        "}",
+        my_ip,
+        HAL_GetTick());
+
+    // 5. Allocation Mémoire
+    p = pbuf_alloc(PBUF_TRANSPORT, strlen(msg), PBUF_RAM);
+
+    if (p != NULL) {
+        pbuf_take(p, (char*)msg, strlen(msg));
+
+        /* --- CORRECTION ICI : udp_sendto_if --- */
+        // Cela résout l'erreur -4 en mode AutoIP
+        err = udp_sendto_if(pcb, p, &dest_ip, 12345, &gnetif);
+
+        if(err != ERR_OK) {
+             log_to_uart("ERR: UDP Send %d", err);
+        } else {
+             // Tu peux décommenter ça pour voir si ça part
+             // log_to_uart("UDP Sent OK");
+        }
+
+        pbuf_free(p);
+    } else {
+        log_to_uart("ERR: Pbuf alloc fail");
+    }
+
+    // 6. DESTRUCTION du PCB
+    udp_remove(pcb);
+}
+
+
 
 
 /* --- Placeholder Tasks (Boucles vides) --- */

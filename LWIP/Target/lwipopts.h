@@ -57,6 +57,12 @@
 #define LWIP_RAM_HEAP_POINTER 0x20048000
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
 #define LWIP_ETHERNET 1
+/*----- Default Value for IP_SOF_BROADCAST: 0 ---*/
+#define IP_SOF_BROADCAST 1
+/*----- Default Value for IP_SOF_BROADCAST_RECV: 0 ---*/
+#define IP_SOF_BROADCAST_RECV 1
+/*----- Default Value for IP_FORWARD_ALLOW_TX_ON_RX_NETIF: 0 ---*/
+#define IP_FORWARD_ALLOW_TX_ON_RX_NETIF 1
 /*----- Value in opt.h for LWIP_DNS_SECURE: (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT) -*/
 #define LWIP_DNS_SECURE 7
 /*----- Value in opt.h for TCP_SND_QUEUELEN: (4*TCP_SND_BUF + (TCP_MSS - 1))/TCP_MSS -----*/
