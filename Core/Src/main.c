@@ -149,6 +149,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -793,32 +794,29 @@ void Start_Task_Net_Broadcast(void const * argument)
 
 /* Fonction inspirée du code de ton ami */
 /* Fonction inspirée du code de ton ami - VERSION CORRIGÉE ROUTAGE */
+/* Fonction send_presence_broadcast - VERSION FINALE BROADCAST */
+/* Fonction send_presence_broadcast - VERSION CORRIGÉE BROADCAST */
 void send_presence_broadcast(void)
 {
     struct udp_pcb *pcb;
     struct pbuf *p;
-    ip_addr_t dest_ip;
     err_t err;
     char msg[256];
     char my_ip[16];
 
-    // 1. Création du PCB (Socket)
+    // 1. Création du PCB
     pcb = udp_new();
-    if (pcb == NULL) {
-        log_to_uart("ERR: UDP Create Fail");
-        return;
-    }
+    if (pcb == NULL) return;
 
-    // 2. Définition de la cible
-    // VERIFIE BIEN QUE C'EST L'IP DE TON PC ACTUELLEMENT !
-    ipaddr_aton("169.254.143.38", &dest_ip);
+    // <--- IMPORTANT FIX 1 : Autoriser le Broadcast sur ce PCB
+    // Sans ça, LwIP refuse d'envoyer le paquet et Wireshark ne voit rien.
+    ip_set_option(pcb, SOF_BROADCAST);
 
-    // 3. Bind local
+    // 2. Bind (Port local 0 = laissé au choix du système)
     udp_bind(pcb, IP_ADDR_ANY, 0);
 
-    // 4. Préparation du JSON dynamique
+    // 3. Préparation du JSON
     ipaddr_ntoa_r(&gnetif.ip_addr, my_ip, 16);
-
     snprintf(msg, sizeof(msg),
         "{\n"
         " \"type\": \"presence\",\n"
@@ -826,32 +824,23 @@ void send_presence_broadcast(void)
         " \"ip\": \"%s\",\n"
         " \"timestamp\": \"%lu\"\n"
         "}",
-        my_ip,
-        HAL_GetTick());
+        my_ip, HAL_GetTick());
 
-    // 5. Allocation Mémoire
+    // 4. Envoi
     p = pbuf_alloc(PBUF_TRANSPORT, strlen(msg), PBUF_RAM);
-
     if (p != NULL) {
         pbuf_take(p, (char*)msg, strlen(msg));
 
-        /* --- CORRECTION ICI : udp_sendto_if --- */
-        // Cela résout l'erreur -4 en mode AutoIP
-        err = udp_sendto_if(pcb, p, &dest_ip, 12345, &gnetif);
-
-        if(err != ERR_OK) {
-             log_to_uart("ERR: UDP Send %d", err);
-        } else {
-             // Tu peux décommenter ça pour voir si ça part
-             // log_to_uart("UDP Sent OK");
-        }
+        // <--- IMPORTANT FIX 2 : Utiliser l'adresse de Broadcast Universelle
+        // IP_ADDR_BROADCAST vaut 255.255.255.255.
+        // Cela garantit que le paquet partira avec l'adresse MAC FF:FF:FF:FF:FF:FF
+        // peu importe ton adresse IP actuelle (192.168... ou 169.254...).
+        udp_sendto_if(pcb, p, IP_ADDR_BROADCAST, 12345, &gnetif);
 
         pbuf_free(p);
-    } else {
-        log_to_uart("ERR: Pbuf alloc fail");
     }
 
-    // 6. DESTRUCTION du PCB
+    // 5. Nettoyage
     udp_remove(pcb);
 }
 
