@@ -792,9 +792,7 @@ void Start_Task_Net_Broadcast(void const * argument)
 
 /* USER CODE BEGIN 4 */
 
-/* Fonction inspirée du code de ton ami */
-/* Fonction inspirée du code de ton ami - VERSION CORRIGÉE ROUTAGE */
-/* Fonction send_presence_broadcast - VERSION FINALE BROADCAST */
+//le unicast fonctionnait mais pas le broadcast car lwip bloque le broadcast donc il fallait ajouter : ip_set_option(pcb, SOF_BROADCAST);
 /* Fonction send_presence_broadcast - VERSION CORRIGÉE BROADCAST */
 void send_presence_broadcast(void)
 {
