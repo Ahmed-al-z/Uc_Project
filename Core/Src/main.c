@@ -785,7 +785,7 @@ void Start_Task_Net_Broadcast(void const * argument)
         send_presence_broadcast();
 
         // Délai de 1s pour les tests
-        osDelay(1000);
+        osDelay(10000);
     }
 }
 
