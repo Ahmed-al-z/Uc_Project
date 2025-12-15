@@ -38,6 +38,12 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define ACCEL_SAMPLES_PER_AXIS_WINDOW_MS 10 // Nombre d'échantillons X,Y,Z reçus tous les 100ms
+#define WINDOW_MS_IN_S 10                  // 10 x 100ms = 1s
+#define ACCEL_SAMPLES_1S (ACCEL_SAMPLES_PER_AXIS_WINDOW_MS * WINDOW_MS_IN_S) // 100 échantillons/axe pour 1s
+
+#define V_REF 3.3f           // Tension de référence ADC (Vref)
+#define ADC_MAX_VAL 4095.0f  // Valeur maximale 12 bits
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,6 +66,24 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
+
+
+/* --- Global System Flags --- */
+
+
+/* Buffer circulaire 1s (100 échantillons/axe) */
+float g_accel_x_buffer_1s[ACCEL_SAMPLES_1S];
+float g_accel_y_buffer_1s[ACCEL_SAMPLES_1S];
+float g_accel_z_buffer_1s[ACCEL_SAMPLES_1S];
+volatile uint16_t g_buffer_index = 0; // Index du prochain échantillon à écrire (0 à 99)
+
+/* Résultats Traitement (Moyenne Glissante et RMS sur 1s) */
+volatile float g_accel_rms_1s = 0.0f;
+volatile float g_accel_avg_1s = 0.0f;
+
+/* Sémaphore de synchronisation Acquisition <-> Traitement */
+osSemaphoreId h_AcqProcSemaphore; // <--- AJOUTER CETTE LIGNE
+
 
 /* --- Global System Flags --- */
 volatile bool g_user_button_pressed = false;
@@ -191,7 +215,7 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 256);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -216,7 +240,7 @@ int main(void)
   osThreadDef(TaskAcq, Start_Task_Acquisition, osPriorityNormal, 0, 256);
   h_TaskAcquisition = osThreadCreate(osThread(TaskAcq), NULL);
 
-  osThreadDef(TaskProc, Start_Task_Processing, osPriorityNormal, 0, 128);
+  osThreadDef(TaskProc, Start_Task_Processing, osPriorityNormal, 0, 1024);
   h_TaskProcessing = osThreadCreate(osThread(TaskProc), NULL);
 
   // 4. Tâches Stockage/Temps (Placeholders)
@@ -235,6 +259,16 @@ int main(void)
 
   osThreadDef(TaskCli, Start_Task_Net_Client, osPriorityNormal, 0, 384);
   h_TaskNetClient = osThreadCreate(osThread(TaskCli), NULL);
+
+
+
+
+
+    // 6. Sémaphore Acquisition <-> Traitement (Synchronisation 100ms)
+    osSemaphoreDef(AcqProcSem);
+    h_AcqProcSemaphore = osSemaphoreCreate(osSemaphore(AcqProcSem), 1);
+
+
 
   /* USER CODE END RTOS_THREADS */
 
@@ -594,7 +628,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -732,34 +766,44 @@ void Start_Task_DebugUART(void const * argument)
 void Start_Task_Acquisition(void const * argument)
 {
     for(;;) {
-		float sum_x = 0, sum_y = 0, sum_z = 0;
+        // float sum_x = 0, sum_y = 0, sum_z = 0; // Anciens calculs de moyenne retirés
 
 		if(g_adc_dma_complete){
+            // Les 30 échantillons bruts (10x X,Y,Z) sont disponibles dans g_adc_dma_buffer
+
+            // L'index de départ pour ce nouveau bloc de 10 échantillons dans le buffer 1s
+            uint16_t start_idx = g_buffer_index;
+
 			for(int i=0; i<30; i++){
 				// Conversion 12 bits -> Volts (3.3V)
-				float val = ((float)g_adc_dma_buffer[i] * 3.3f) / 4095.0f;
+				float val = ((float)g_adc_dma_buffer[i] * V_REF) / ADC_MAX_VAL;
 
-                if(i % 3 == 0) {
-					g_accel_x_samples[i/3] = val;
-					sum_x += val;
+                // Calcul de l'index de stockage pour l'échantillon i dans le buffer 1s
+                uint16_t sample_idx = start_idx + (i / 3);
+
+                if(i % 3 == 0) { // X
+					g_accel_x_buffer_1s[sample_idx] = val;
 				}
-				else if(i % 3 == 1) {
-					g_accel_y_samples[i/3] = val;
-					sum_y += val;
+				else if(i % 3 == 1) { // Y
+					g_accel_y_buffer_1s[sample_idx] = val;
 				}
-				else if(i % 3 == 2) {
-					g_accel_z_samples[i/3] = val;
-					sum_z += val;
+				else if(i % 3 == 2) { // Z
+					g_accel_z_buffer_1s[sample_idx] = val;
 				}
 			}
 
-			g_adc_dma_complete = 0; // Reset Flag
+            // Mettre à jour l'index du prochain bloc de 10 échantillons (100ms)
+            g_buffer_index += ACCEL_SAMPLES_PER_AXIS_WINDOW_MS;
+            if (g_buffer_index >= ACCEL_SAMPLES_1S) {
+                g_buffer_index = 0; // Retour au début du buffer circulaire
+            }
 
-			g_accel_mean_x = sum_x / 10.0f;
-			g_accel_mean_y = sum_y / 10.0f;
-			g_accel_mean_z = sum_z / 10.0f;
+			g_adc_dma_complete = 0; // Reset Flag DMA
+
+            // Signalement à la tâche de traitement que 10 nouveaux échantillons sont là
+            osSemaphoreRelease(h_AcqProcSemaphore);
 		}
-		osDelay(5);
+        osDelay(1); // La tâche ne doit pas monopoliser le CPU
     }
 }
 
@@ -842,11 +886,76 @@ void send_presence_broadcast(void)
     udp_remove(pcb);
 }
 
+/* 4. Tâche Traitement (Seismic processing) */
+void Start_Task_Processing(void const * argument)
+{
+    // Seuil de déclenchement (0.05V est un bon début pour l'ADXL335)
+    const float SEISMIC_THRESHOLD_RMS = 0.050f;
 
+    // Petite attente au démarrage
+    osDelay(1000);
 
+    for(;;)
+    {
+        // 1. Attente des données (toutes les 100ms, on a de nouvelles données,
+        // mais ici on traite le buffer circulaire complet de 1s pour le RMS)
+        // Note: Dans une vraie implémentation temps réel stricte, on traiterait par fenêtre glissante.
+        // Ici, on synchronise simplement.
+        osSemaphoreWait(h_AcqProcSemaphore, osWaitForever);
 
+        float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
+        float mean_x = 0.0f, mean_y = 0.0f, mean_z = 0.0f;
+        float sum_sq_diff = 0.0f;
+
+        /* ETAPE A : Calculer la MOYENNE (Composante DC + Gravité) */
+        // Ceci permet de trouver le "zéro" actuel de chaque axe
+        for (int i = 0; i < ACCEL_SAMPLES_1S; i++) {
+            sum_x += g_accel_x_buffer_1s[i];
+            sum_y += g_accel_y_buffer_1s[i];
+            sum_z += g_accel_z_buffer_1s[i];
+        }
+
+        mean_x = sum_x / (float)ACCEL_SAMPLES_1S;
+        mean_y = sum_y / (float)ACCEL_SAMPLES_1S;
+        mean_z = sum_z / (float)ACCEL_SAMPLES_1S;
+
+        // On stocke ces moyennes pour l'affichage ou le debug si besoin
+        g_accel_mean_x = mean_x;
+        g_accel_mean_y = mean_y;
+        g_accel_mean_z = mean_z;
+
+        /* ETAPE B : Calculer le RMS de la VIBRATION (AC uniquement) */
+        // On soustrait la moyenne calculée juste au-dessus.
+        // RMS = Racine carrée de la moyenne des carrés des écarts (Standard Deviation)
+
+        for (int i = 0; i < ACCEL_SAMPLES_1S; i++) {
+            float diff_x = g_accel_x_buffer_1s[i] - mean_x;
+            float diff_y = g_accel_y_buffer_1s[i] - mean_y;
+            float diff_z = g_accel_z_buffer_1s[i] - mean_z;
+
+            // On accumule l'énergie cinétique (écart au carré) des 3 axes
+            sum_sq_diff += (diff_x * diff_x) + (diff_y * diff_y) + (diff_z * diff_z);
+        }
+
+        // Total d'échantillons pris en compte (3 axes * nombre d'échantillons)
+        int total_points = 3 * ACCEL_SAMPLES_1S;
+
+        // Racine carrée de la variance globale
+        g_accel_rms_1s = sqrtf(sum_sq_diff / (float)total_points);
+
+        // Debug UART (Optionnel : pour voir ce qui se passe)
+        // log_to_uart("Seismic: MeanZ=%.2fV | RMS=%.4fV", mean_z, g_accel_rms_1s);
+
+        /* ETAPE C : Logique d'Alarme */
+        if (g_accel_rms_1s > SEISMIC_THRESHOLD_RMS) {
+            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_SET);
+            log_to_uart("ALERTE SISMIQUE ! RMS=%.4f V", g_accel_rms_1s);
+        } else {
+            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_RESET);
+        }
+    }
+}
 /* --- Placeholder Tasks (Boucles vides) --- */
-void Start_Task_Processing(void const * argument)   { for(;;) { osDelay(1000); } }
 void Start_Task_TimeSync(void const * argument)     { for(;;) { osDelay(1000); } }
 void Start_Task_Storage(void const * argument)      { for(;;) { osDelay(1000); } }
 void Start_Task_Net_Server(void const * argument)   { for(;;) { osDelay(1000); } }
