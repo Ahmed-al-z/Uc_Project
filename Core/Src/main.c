@@ -24,6 +24,7 @@
 #include "lwip/ip_addr.h"
 #include "lwip/netif.h"
 #include "lwip/inet.h"
+#include "lwip/sockets.h"
 
 extern struct netif gnetif;
 /* USER CODE END Includes */
@@ -98,7 +99,7 @@ float g_accel_mean_x = 0.0f;
 float g_accel_mean_y = 0.0f;
 float g_accel_mean_z = 0.0f;
 
-/* --- RTOS Task Handles (Renommés selon PDF) --- */
+/* --- RTOS Task Handles  --- */
 /* 1. Tâches Principales */
 osThreadId h_TaskMaster;        // Tâche Maître (Gère le bouton)
 osThreadId h_TaskHeartbeat;     // Tâche Heartbeat (LED)
@@ -215,7 +216,7 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 256);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -254,10 +255,10 @@ int main(void)
   osThreadDef(TaskBcast, Start_Task_Net_Broadcast, osPriorityBelowNormal, 0, 256);
   h_TaskNetBroadcast = osThreadCreate(osThread(TaskBcast), NULL);
 
-  osThreadDef(TaskServ, Start_Task_Net_Server, osPriorityAboveNormal, 0, 384);
+  osThreadDef(TaskServ, Start_Task_Net_Server, osPriorityAboveNormal, 0, 1024);
   h_TaskNetServer = osThreadCreate(osThread(TaskServ), NULL);
 
-  osThreadDef(TaskCli, Start_Task_Net_Client, osPriorityNormal, 0, 384);
+  osThreadDef(TaskCli, Start_Task_Net_Client, osPriorityNormal, 0, 770);
   h_TaskNetClient = osThreadCreate(osThread(TaskCli), NULL);
 
 
@@ -628,7 +629,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA2_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 
 }
@@ -809,7 +810,6 @@ void Start_Task_Acquisition(void const * argument)
 
 
 /* 5. Tâche Broadcast (UDP) */
-/* 5. Tâche Broadcast (UDP) - STYLE "AMI" */
 void Start_Task_Net_Broadcast(void const * argument)
 {
     /* 1. Attente du lien Ethernet */
@@ -825,10 +825,10 @@ void Start_Task_Net_Broadcast(void const * argument)
 
     for(;;)
     {
-        // Appel de la fonction séparée (comme ton ami)
+        // Appel de la fonction séparée
         send_presence_broadcast();
 
-        // Délai de 1s pour les tests
+        // Délai de 10s pour les tests
         osDelay(10000);
     }
 }
@@ -862,7 +862,7 @@ void send_presence_broadcast(void)
     snprintf(msg, sizeof(msg),
         "{\n"
         " \"type\": \"presence\",\n"
-        " \"id\": \"nucleo-moi\",\n"
+        " \"id\": \"nucleo-Ahmed\",\n"
         " \"ip\": \"%s\",\n"
         " \"timestamp\": \"%lu\"\n"
         "}",
@@ -879,6 +879,7 @@ void send_presence_broadcast(void)
         // peu importe ton adresse IP actuelle (192.168... ou 169.254...).
         udp_sendto_if(pcb, p, IP_ADDR_BROADCAST, 12345, &gnetif);
 
+
         pbuf_free(p);
     }
 
@@ -886,7 +887,7 @@ void send_presence_broadcast(void)
     udp_remove(pcb);
 }
 
-/* 4. Tâche Traitement (Seismic processing) */
+/* 7. Tâche Traitement (Seismic processing) */
 void Start_Task_Processing(void const * argument)
 {
     // Seuil de déclenchement (0.05V est un bon début pour l'ADXL335)
@@ -955,11 +956,227 @@ void Start_Task_Processing(void const * argument)
         }
     }
 }
+
+
+/* 8. Tâche Serveur TCP (Répond aux requêtes) */
+void Start_Task_Net_Server(void const * argument)
+{
+    int server_sock, client_sock;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len;
+    int bytes_read;
+    char rx_buffer[512];
+    char tx_buffer[512];
+
+    while (!netif_is_up(&gnetif) || ip_addr_isany(&gnetif.ip_addr)) {
+        osDelay(1000);
+    }
+    log_to_uart("SRV: Server Ready on Port 12345");
+
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        log_to_uart("SRV: Error creating socket");
+        vTaskDelete(NULL);
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(12345);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        log_to_uart("SRV: Error binding");
+        close(server_sock);
+        vTaskDelete(NULL);
+    }
+
+    if (listen(server_sock, 5) < 0) {
+        log_to_uart("SRV: Error listening");
+        close(server_sock);
+        vTaskDelete(NULL);
+    }
+
+    for(;;)
+    {
+        client_addr_len = sizeof(client_addr);
+        // Accept est bloquant
+        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
+
+        if (client_sock >= 0) {
+
+            memset(rx_buffer, 0, sizeof(rx_buffer));
+            // On laisse 100ms max pour recevoir la donnée (évite un blocage infini si le client n'envoie rien)
+            struct timeval tv;
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; // 100 ms
+            setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+            bytes_read = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+
+            if (bytes_read > 0) {
+                // Si c'est une requête valide
+                if (strstr(rx_buffer, "data_request") != NULL)
+                {
+                    float my_x = g_accel_mean_x;
+                    float my_y = g_accel_mean_y;
+                    float my_z = g_accel_mean_z;
+
+                    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                        "{\n"
+                        " \"type\": \"data_response\",\n"
+                        " \"id\": \"nucleo-Ahmed\",\n"
+                        " \"timestamp\": \"%lu\",\n"
+                        " \"acceleration\": {\n"
+                        "   \"x\": %.2f,\n"
+                        "   \"y\": %.2f,\n"
+                        "   \"z\": %.2f\n"
+                        " },\n"
+                        " \"status\": \"%s\"\n"
+                        "}",
+                        HAL_GetTick(),
+                        my_x, my_y, my_z,
+                        (g_accel_rms_1s > 0.05f) ? "alert" : "normal"
+                    );
+
+                    send(client_sock, tx_buffer, len, 0);
+                }
+            }
+
+            // --- CORRECTION CRITIQUE ICI ---
+            // On attend un tout petit peu que LwIP vide le buffer d'envoi
+            // avant de couper brutalement la ligne.
+            osDelay(20);
+
+            close(client_sock);
+        }
+
+        // Petit délai pour laisser FreeRTOS faire le ménage mémoire
+        osDelay(10);
+    }
+}
+
+
+/* Structure pour stocker les infos des collègues */
+typedef struct {
+    char* name;
+    char* id;
+    char* ip;
+} Peer_t;
+
+/* 9. Tâche Client TCP (Interroge les autres cartes) */
+void Start_Task_Net_Client(void const * argument)
+{
+    // Liste des pairs basée sur  fichier Excel
+    // J'ai ajouté "PC_Test" à la fin pour que tu puisses tester avec ton PC (192.168.1.50)
+    Peer_t peers[] = {
+    		{"Kate",     "nucleo-6",  "192.168.129.72"},
+    		//  {"Arthur",   "nucleo-14", "192.168.1.185"},
+    		 {"Ilya",     "nucleo-8",  "192.168.129.181"},
+    		//  {"Maxime",   "nucleo-3",  "192.168.1.183"},
+    		//   {"Charles",  "nucleo-20", "192.168.1.151"},
+    		//   {"Marvin",   "nucleo-12", "192.168.1.191"},
+    		//   {"Ethan",    "nucleo-22", "192.168.1.222"},
+        // Ajoute l'IP de ton PC ici pour tester seul !
+       // {"PC_Sim",   "pc-debug",  "192.168.129.73"}
+    };
+
+    int num_peers = sizeof(peers) / sizeof(peers[0]);
+    int sock;
+    struct sockaddr_in server_addr;
+    char tx_buffer[256];
+    char rx_buffer[512];
+    int bytes_received;
+
+    // Attente lien réseau
+    while (!netif_is_up(&gnetif) || ip_addr_isany(&gnetif.ip_addr)) {
+        osDelay(1000);
+    }
+    log_to_uart("CLI: Client Task Started. Scanning %d peers...", num_peers);
+
+    for(;;)
+    {
+        // On parcourt la liste des collègues
+        for (int i = 0; i < num_peers; i++)
+        {
+            // 1. Création Socket
+            sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) {
+                log_to_uart("CLI: Error creating socket");
+                continue;
+            }
+
+            // Configuration du timeout de réception (important si le collègue ne répond pas)
+            struct timeval tv;
+            tv.tv_sec = 2;   // 2 secondes max d'attente pour la réponse
+            tv.tv_usec = 0;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+            // 2. Configuration Adresse Cible
+            memset(&server_addr, 0, sizeof(server_addr));
+            server_addr.sin_family = AF_INET;
+            server_addr.sin_port = htons(12345); // Port standard du projet
+            server_addr.sin_addr.s_addr = inet_addr(peers[i].ip);
+
+            log_to_uart("CLI: Connecting to %s (%s)...", peers[i].name, peers[i].ip);
+
+            // 3. Connexion (Connect)
+            // Note: connect est bloquant. Si l'IP n'existe pas, ça peut prendre quelques secondes avant d'échouer.
+            if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+                // Echec connexion (Normal si le collègue n'est pas là)
+                 log_to_uart("CLI: %s Unreachable", peers[i].name);
+                close(sock);
+                osDelay(100); // Petite pause avant le suivant
+                continue;
+            }
+
+            // 4. Préparation de la requête JSON
+            int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                "{\n"
+                " \"type\": \"data_request\",\n"
+                " \"from\": \"nucleo-Ahmed\",\n"
+                " \"to\": \"%s\",\n"
+                " \"timestamp\": \"%lu\"\n"
+                "}",
+                peers[i].id,
+                HAL_GetTick());
+
+            // 5. Envoi
+            if (send(sock, tx_buffer, len, 0) < 0) {
+                log_to_uart("CLI: Send failed to %s", peers[i].name);
+                close(sock);
+                continue;
+            }
+
+            // 6. Réception de la réponse
+            memset(rx_buffer, 0, sizeof(rx_buffer));
+            bytes_received = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+
+            if (bytes_received > 0) {
+                log_to_uart("CLI: RECV from %s: %s", peers[i].name, rx_buffer);
+                // C'est ICI qu'il faudra faire le parsing JSON plus tard (Step 3)
+            } else {
+                log_to_uart("CLI: No response from %s", peers[i].name);
+            }
+
+            // 7. Fermeture propre
+            close(sock);
+
+            // Pause entre chaque requête pour ne pas spammer le réseau
+            osDelay(500);
+        }
+
+        // Une fois qu'on a fait le tour de tout le monde, on attend un peu avant de recommencer
+        log_to_uart("CLI: Round finished. Waiting 5s...");
+        osDelay(20000);
+    }
+}
+
+
 /* --- Placeholder Tasks (Boucles vides) --- */
 void Start_Task_TimeSync(void const * argument)     { for(;;) { osDelay(1000); } }
 void Start_Task_Storage(void const * argument)      { for(;;) { osDelay(1000); } }
-void Start_Task_Net_Server(void const * argument)   { for(;;) { osDelay(1000); } }
-void Start_Task_Net_Client(void const * argument)   { for(;;) { osDelay(1000); } }
+
+
 
 /* ======================= CALLBACKS ======================= */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin){
