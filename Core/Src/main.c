@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 /* LWIP includes */
 #include "lwip/udp.h"
 #include "lwip/dns.h"
@@ -34,7 +35,16 @@ extern struct netif gnetif;
 typedef struct {
   uint32_t id;
   char     text[128];
-} LogMessage_t; // Renommé pour clarté
+} LogMessage_t;
+
+
+typedef struct {
+    float rms_value;       // Valeur de la secousse
+    uint32_t timestamp;    // Quand c'est arrivé
+    char source_id[16];
+} SeismicEvent_t;
+
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -76,14 +86,14 @@ osThreadId defaultTaskHandle;
 float g_accel_x_buffer_1s[ACCEL_SAMPLES_1S];
 float g_accel_y_buffer_1s[ACCEL_SAMPLES_1S];
 float g_accel_z_buffer_1s[ACCEL_SAMPLES_1S];
-volatile uint16_t g_buffer_index = 0; // Index du prochain échantillon à écrire (0 à 99)
+volatile uint16_t g_buffer_index = 0;
 
 /* Résultats Traitement (Moyenne Glissante et RMS sur 1s) */
 volatile float g_accel_rms_1s = 0.0f;
 volatile float g_accel_avg_1s = 0.0f;
 
-/* Sémaphore de synchronisation Acquisition <-> Traitement */
-osSemaphoreId h_AcqProcSemaphore; // <--- AJOUTER CETTE LIGNE
+/* Sémaphore de synchronisation Acquisition - Traitement */
+osSemaphoreId h_AcqProcSemaphore;
 
 
 /* --- Global System Flags --- */
@@ -119,6 +129,27 @@ osThreadId h_TaskNetBroadcast;  // Tâche Broadcast (UDP)
 osThreadId h_TaskNetServer;     // Serveur (Placeholder Step 2)
 osThreadId h_TaskNetClient;     // Client (Placeholder Step 2)
 
+
+osSemaphoreId h_StorageSemaphore; // Le réveil pour la tâche stockage
+
+
+#define FRAM_STORAGE_ADDR 0x000000
+#define MAX_STORED_EVENTS 10
+
+// 1. Liste des 10 plus gros séismes
+volatile SeismicEvent_t g_top_10_events[MAX_STORED_EVENTS];
+volatile int g_events_count = 0;
+
+// 2. Flags pour la décision collective (Consensus)
+volatile bool g_local_shake_detected = false;
+volatile bool g_peer_shake_detected = false;
+volatile uint32_t g_last_local_shake_time = 0;
+volatile uint32_t g_last_peer_shake_time = 0;
+
+// 3. Outils de Synchro FreeRTOS
+osMutexId h_Top10Mutex;          // Protège la liste quand on écrit dedans
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -143,12 +174,12 @@ void Start_Task_Heartbeat(void const * argument);
 void Start_Task_DebugUART(void const * argument);
 
 void Start_Task_Acquisition(void const * argument);
-void Start_Task_Processing(void const * argument); // Ex-Safety
+void Start_Task_Processing(void const * argument);
 
 void Start_Task_TimeSync(void const * argument);
 void Start_Task_Storage(void const * argument);
 
-void Start_Task_Net_Broadcast(void const * argument); // Ex-Discovery
+void Start_Task_Net_Broadcast(void const * argument);
 void Start_Task_Net_Server(void const * argument);
 void Start_Task_Net_Client(void const * argument);
 void presence_broadcast(void);
@@ -203,6 +234,11 @@ int main(void)
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
+
+  osMutexDef(Top10Mut);
+  h_Top10Mutex = osMutexCreate(osMutex(Top10Mut));
+
+
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -271,12 +307,19 @@ int main(void)
 
 
 
+      osSemaphoreDef(StoreSem);
+      h_StorageSemaphore = osSemaphoreCreate(osSemaphore(StoreSem), 1);
+
+      // On prend le sémaphore tout de suite pour qu'il soit "vide" au départ (la tâche dormira)
+      osSemaphoreWait(h_StorageSemaphore, 0);
+
+
+
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
   osKernelStart();
 
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -651,11 +694,15 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, Heart_Pin|alarme_Pin|LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(FRAM_CS_GPIO_Port, FRAM_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
@@ -672,6 +719,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : FRAM_CS_Pin */
+  GPIO_InitStruct.Pin = FRAM_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(FRAM_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
   GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
@@ -837,7 +891,7 @@ void Start_Task_Net_Broadcast(void const * argument)
 /* USER CODE BEGIN 4 */
 
 //le unicast fonctionnait mais pas le broadcast car lwip bloque le broadcast donc il fallait ajouter : ip_set_option(pcb, SOF_BROADCAST);
-/* Fonction send_presence_broadcast - VERSION CORRIGÉE BROADCAST */
+/* Fonction send_presence_broadcast    */
 void send_presence_broadcast(void)
 {
     struct udp_pcb *pcb;
@@ -850,14 +904,12 @@ void send_presence_broadcast(void)
     pcb = udp_new();
     if (pcb == NULL) return;
 
-    // <--- IMPORTANT FIX 1 : Autoriser le Broadcast sur ce PCB
+    //   Autoriser le Broadcast sur ce PCB
     // Sans ça, LwIP refuse d'envoyer le paquet et Wireshark ne voit rien.
     ip_set_option(pcb, SOF_BROADCAST);
 
-    // 2. Bind (Port local 0 = laissé au choix du système)
     udp_bind(pcb, IP_ADDR_ANY, 0);
 
-    // 3. Préparation du JSON
     ipaddr_ntoa_r(&gnetif.ip_addr, my_ip, 16);
     snprintf(msg, sizeof(msg),
         "{\n"
@@ -873,90 +925,102 @@ void send_presence_broadcast(void)
     if (p != NULL) {
         pbuf_take(p, (char*)msg, strlen(msg));
 
-        // <--- IMPORTANT FIX 2 : Utiliser l'adresse de Broadcast Universelle
-        // IP_ADDR_BROADCAST vaut 255.255.255.255.
-        // Cela garantit que le paquet partira avec l'adresse MAC FF:FF:FF:FF:FF:FF
-        // peu importe ton adresse IP actuelle (192.168... ou 169.254...).
         udp_sendto_if(pcb, p, IP_ADDR_BROADCAST, 12345, &gnetif);
 
 
         pbuf_free(p);
     }
 
-    // 5. Nettoyage
     udp_remove(pcb);
 }
 
-/* 7. Tâche Traitement (Seismic processing) */
+/* 7. Tâche Traitement (Seismic processing + Consensus) */
 void Start_Task_Processing(void const * argument)
 {
-    // Seuil de déclenchement (0.05V est un bon début pour l'ADXL335)
     const float SEISMIC_THRESHOLD_RMS = 0.050f;
-
-    // Petite attente au démarrage
     osDelay(1000);
+
+    bool alarm_active_state = false;
 
     for(;;)
     {
-        // 1. Attente des données (toutes les 100ms, on a de nouvelles données,
-        // mais ici on traite le buffer circulaire complet de 1s pour le RMS)
-        // Note: Dans une vraie implémentation temps réel stricte, on traiterait par fenêtre glissante.
-        // Ici, on synchronise simplement.
         osSemaphoreWait(h_AcqProcSemaphore, osWaitForever);
 
-        float sum_x = 0.0f, sum_y = 0.0f, sum_z = 0.0f;
-        float mean_x = 0.0f, mean_y = 0.0f, mean_z = 0.0f;
-        float sum_sq_diff = 0.0f;
+        float sum_x = 0, sum_y = 0, sum_z = 0;
+        float sum_sq_diff = 0;
 
-        /* ETAPE A : Calculer la MOYENNE (Composante DC + Gravité) */
-        // Ceci permet de trouver le "zéro" actuel de chaque axe
+        // --- CALCULS MATHS ---
+        // 1. Moyenne
         for (int i = 0; i < ACCEL_SAMPLES_1S; i++) {
             sum_x += g_accel_x_buffer_1s[i];
             sum_y += g_accel_y_buffer_1s[i];
             sum_z += g_accel_z_buffer_1s[i];
         }
+        g_accel_mean_x = sum_x / (float)ACCEL_SAMPLES_1S;
+        g_accel_mean_y = sum_y / (float)ACCEL_SAMPLES_1S;
+        g_accel_mean_z = sum_z / (float)ACCEL_SAMPLES_1S;
 
-        mean_x = sum_x / (float)ACCEL_SAMPLES_1S;
-        mean_y = sum_y / (float)ACCEL_SAMPLES_1S;
-        mean_z = sum_z / (float)ACCEL_SAMPLES_1S;
-
-        // On stocke ces moyennes pour l'affichage ou le debug si besoin
-        g_accel_mean_x = mean_x;
-        g_accel_mean_y = mean_y;
-        g_accel_mean_z = mean_z;
-
-        /* ETAPE B : Calculer le RMS de la VIBRATION (AC uniquement) */
-        // On soustrait la moyenne calculée juste au-dessus.
-        // RMS = Racine carrée de la moyenne des carrés des écarts (Standard Deviation)
-
+        // 2. RMS
         for (int i = 0; i < ACCEL_SAMPLES_1S; i++) {
-            float diff_x = g_accel_x_buffer_1s[i] - mean_x;
-            float diff_y = g_accel_y_buffer_1s[i] - mean_y;
-            float diff_z = g_accel_z_buffer_1s[i] - mean_z;
+            float dx = g_accel_x_buffer_1s[i] - g_accel_mean_x;
+            float dy = g_accel_y_buffer_1s[i] - g_accel_mean_y;
+            float dz = g_accel_z_buffer_1s[i] - g_accel_mean_z;
+            sum_sq_diff += (dx*dx) + (dy*dy) + (dz*dz);
+        }
+        g_accel_rms_1s = sqrtf(sum_sq_diff / (float)(3 * ACCEL_SAMPLES_1S));
 
-            // On accumule l'énergie cinétique (écart au carré) des 3 axes
-            sum_sq_diff += (diff_x * diff_x) + (diff_y * diff_y) + (diff_z * diff_z);
+        // --- LOGIQUE DETECTION ---
+
+        // A. Détection Locale
+        if (g_accel_rms_1s > SEISMIC_THRESHOLD_RMS) {
+            g_local_shake_detected = true;
+            g_last_local_shake_time = HAL_GetTick();
+
+            // SAUVEGARDE FRAM (Top 10)
+            update_top_10_events(g_accel_rms_1s, "local");
+
+            HAL_GPIO_TogglePin(GPIOB, LD2_Pin);
+        } else {
+            // Reset après 2s
+            if (HAL_GetTick() - g_last_local_shake_time > 2000) {
+                g_local_shake_detected = false;
+                 HAL_GPIO_WritePin(GPIOB, LD2_Pin, GPIO_PIN_RESET);
+            }
         }
 
-        // Total d'échantillons pris en compte (3 axes * nombre d'échantillons)
-        int total_points = 3 * ACCEL_SAMPLES_1S;
+        // B. Consensus (ALARME GENERALE)
+        // Condition : MOI (Local) ET LUI (Peer) on tremble en même temps
+        bool condition_consensus = g_local_shake_detected && g_peer_shake_detected;
 
-        // Racine carrée de la variance globale
-        g_accel_rms_1s = sqrtf(sum_sq_diff / (float)total_points);
+        // Vérifions que l'info du voisin n'est pas périmée (>2s)
+        if (g_peer_shake_detected && (HAL_GetTick() - g_last_peer_shake_time > 2000)) {
+            g_peer_shake_detected = false; // Info trop vieille
+            condition_consensus = false;
+        }
 
-        // Debug UART (Optionnel : pour voir ce qui se passe)
-        // log_to_uart("Seismic: MeanZ=%.2fV | RMS=%.4fV", mean_z, g_accel_rms_1s);
+        if (condition_consensus) {
+            // --- CAS D'ALARME ---
+            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_SET); // LED ROUGE ON
 
-        /* ETAPE C : Logique d'Alarme */
-        if (g_accel_rms_1s > SEISMIC_THRESHOLD_RMS) {
-            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_SET);
-            log_to_uart("ALERTE SISMIQUE ! RMS=%.4f V", g_accel_rms_1s);
+            if (!alarm_active_state) {
+                vTaskSuspend(h_TaskHeartbeat);
+                alarm_active_state = true;
+                log_to_uart("!!! ALARME GENERALE - SYSTEME FIGE !!!");
+            }
+
         } else {
-            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_RESET);
+            // --- CAS NORMAL ---
+            HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_RESET); // LED ROUGE OFF
+
+            if (alarm_active_state) {
+                // L'alarme est finie, on relance le coeur
+                vTaskResume(h_TaskHeartbeat);
+                alarm_active_state = false;
+                log_to_uart("Systeme Stabilise - Reprise");
+            }
         }
     }
 }
-
 
 /* 8. Tâche Serveur TCP (Répond aux requêtes) */
 void Start_Task_Net_Server(void const * argument)
@@ -1042,15 +1106,12 @@ void Start_Task_Net_Server(void const * argument)
                 }
             }
 
-            // --- CORRECTION CRITIQUE ICI ---
-            // On attend un tout petit peu que LwIP vide le buffer d'envoi
-            // avant de couper brutalement la ligne.
+
             osDelay(20);
 
             close(client_sock);
         }
 
-        // Petit délai pour laisser FreeRTOS faire le ménage mémoire
         osDelay(10);
     }
 }
@@ -1066,18 +1127,15 @@ typedef struct {
 /* 9. Tâche Client TCP (Interroge les autres cartes) */
 void Start_Task_Net_Client(void const * argument)
 {
-    // Liste des pairs basée sur  fichier Excel
-    // J'ai ajouté "PC_Test" à la fin pour que tu puisses tester avec ton PC (192.168.1.50)
     Peer_t peers[] = {
-    		{"Kate",     "nucleo-6",  "192.168.129.72"},
+    		//{"Kate",     "nucleo-6",  "192.168.129.72"},
     		//  {"Arthur",   "nucleo-14", "192.168.1.185"},
-    		 {"Ilya",     "nucleo-8",  "192.168.129.181"},
+    		 //{"Ilya",     "nucleo-8",  "192.168.129.181"},
     		//  {"Maxime",   "nucleo-3",  "192.168.1.183"},
     		//   {"Charles",  "nucleo-20", "192.168.1.151"},
     		//   {"Marvin",   "nucleo-12", "192.168.1.191"},
     		//   {"Ethan",    "nucleo-22", "192.168.1.222"},
-        // Ajoute l'IP de ton PC ici pour tester seul !
-       // {"PC_Sim",   "pc-debug",  "192.168.129.73"}
+       {"PC_Sim",   "pc-debug",  "192.168.1.50"}
     };
 
     int num_peers = sizeof(peers) / sizeof(peers[0]);
@@ -1120,7 +1178,6 @@ void Start_Task_Net_Client(void const * argument)
             log_to_uart("CLI: Connecting to %s (%s)...", peers[i].name, peers[i].ip);
 
             // 3. Connexion (Connect)
-            // Note: connect est bloquant. Si l'IP n'existe pas, ça peut prendre quelques secondes avant d'échouer.
             if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
                 // Echec connexion (Normal si le collègue n'est pas là)
                  log_to_uart("CLI: %s Unreachable", peers[i].name);
@@ -1152,29 +1209,188 @@ void Start_Task_Net_Client(void const * argument)
             bytes_received = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
 
             if (bytes_received > 0) {
-                log_to_uart("CLI: RECV from %s: %s", peers[i].name, rx_buffer);
-                // C'est ICI qu'il faudra faire le parsing JSON plus tard (Step 3)
-            } else {
+                            // log_to_uart("CLI: RECV from %s", peers[i].name);
+
+                            // --- ETAPE 3 : Analyse simple du JSON ---
+
+                            // 1. Chercher si le voisin est en alerte
+                            if (strstr(rx_buffer, "\"status\": \"alert\"") != NULL || strstr(rx_buffer, "\"alert\"") != NULL) {
+                                g_peer_shake_detected = true;
+                                g_last_peer_shake_time = HAL_GetTick();
+                                log_to_uart("CONSENSUS: Peer %s signals ALERT!", peers[i].name);
+                            }
+
+                            // 2. Chercher si le voisin envoie une forte vibration (pour le Top 10)
+                            char* pX = strstr(rx_buffer, "\"x\":");
+                            if(pX) {
+                                float val_x = 0;
+                                // Lecture un peu "brute" mais efficace
+                                if(sscanf(pX + 4, "%f", &val_x) == 1) {
+                                     // Si c'est fort (>0.1), on l'enregistre
+                                     if(val_x > 0.1f || val_x < -0.1f) {
+                                         update_top_10_events(fabs(val_x), peers[i].id);
+                                     }
+                                }
+                            }
+                        } else {
                 log_to_uart("CLI: No response from %s", peers[i].name);
             }
 
             // 7. Fermeture propre
             close(sock);
 
-            // Pause entre chaque requête pour ne pas spammer le réseau
             osDelay(500);
         }
 
-        // Une fois qu'on a fait le tour de tout le monde, on attend un peu avant de recommencer
         log_to_uart("CLI: Round finished. Waiting 5s...");
         osDelay(20000);
     }
 }
 
 
+
+
+
+
+/* 8. Tâche Stockage (Gère la FRAM ) */
+
+// --- A. DRIVER FRAM (Mode Burst) ---
+// Adresses et commandes
+#define FRAM_WREN  0x06
+#define FRAM_WRITE 0x02
+#define FRAM_READ  0x03
+
+void FRAM_CS_Select(void) {
+    HAL_GPIO_WritePin(FRAM_CS_GPIO_Port, FRAM_CS_Pin, GPIO_PIN_RESET);
+}
+void FRAM_CS_Deselect(void) {
+    HAL_GPIO_WritePin(FRAM_CS_GPIO_Port, FRAM_CS_Pin, GPIO_PIN_SET);
+}
+
+// Ecriture rapide d'un bloc complet
+void FRAM_WriteBurst(SPI_HandleTypeDef *hspi, uint32_t address, uint8_t *pData, uint16_t size) {
+    uint8_t cmd[4];
+    // 1. WREN
+    FRAM_CS_Select();
+    cmd[0] = FRAM_WREN;
+    HAL_SPI_Transmit(hspi, &cmd[0], 1, 100);
+    FRAM_CS_Deselect();
+    for(volatile int i=0; i<50; i++); // Petit délai
+
+    // 2. WRITE + Address + Data
+    FRAM_CS_Select();
+    cmd[0] = FRAM_WRITE;
+    cmd[1] = (address >> 16) & 0xFF;
+    cmd[2] = (address >> 8)  & 0xFF;
+    cmd[3] = (address)       & 0xFF;
+    HAL_SPI_Transmit(hspi, cmd, 4, 100);       // En-tête
+    HAL_SPI_Transmit(hspi, pData, size, 1000); // Données
+    FRAM_CS_Deselect();
+}
+
+// Lecture rapide d'un bloc complet
+void FRAM_ReadBurst(SPI_HandleTypeDef *hspi, uint32_t address, uint8_t *pData, uint16_t size) {
+    uint8_t cmd[4];
+    FRAM_CS_Select();
+    cmd[0] = FRAM_READ;
+    cmd[1] = (address >> 16) & 0xFF;
+    cmd[2] = (address >> 8)  & 0xFF;
+    cmd[3] = (address)       & 0xFF;
+    HAL_SPI_Transmit(hspi, cmd, 4, 100);
+    HAL_SPI_Receive(hspi, pData, size, 1000);
+    FRAM_CS_Deselect();
+}
+
+// --- B. FONCTIONS HAUT NIVEAU ---
+void Save_Top10_To_FRAM(void) {
+    // Sauvegarde la tableau ET le compteur
+    FRAM_WriteBurst(&hspi2, FRAM_STORAGE_ADDR, (uint8_t*)g_top_10_events, sizeof(g_top_10_events));
+    FRAM_WriteBurst(&hspi2, FRAM_STORAGE_ADDR + sizeof(g_top_10_events), (uint8_t*)&g_events_count, sizeof(g_events_count));
+}
+
+void Load_Top10_From_FRAM(void) {
+    FRAM_ReadBurst(&hspi2, FRAM_STORAGE_ADDR, (uint8_t*)g_top_10_events, sizeof(g_top_10_events));
+    FRAM_ReadBurst(&hspi2, FRAM_STORAGE_ADDR + sizeof(g_top_10_events), (uint8_t*)&g_events_count, sizeof(g_events_count));
+    // Reset si corrompu
+    if(g_events_count < 0 || g_events_count > MAX_STORED_EVENTS) g_events_count = 0;
+}
+
+// --- C. LOGIQUE TOP 10 ---
+// C'est cette fonction qui décide si on garde l'événement et qui réveille la tâche stockage
+void update_top_10_events(float rms, const char* source_id) {
+    if (rms < 0.05f) return; // Seuil minimum
+    bool changed = false;
+
+    osMutexWait(h_Top10Mutex, osWaitForever); // On protège la liste
+
+    // 1. Ajout direct s'il y a de la place
+    if (g_events_count < MAX_STORED_EVENTS) {
+        g_top_10_events[g_events_count].rms_value = rms;
+        g_top_10_events[g_events_count].timestamp = HAL_GetTick();
+        strncpy(g_top_10_events[g_events_count].source_id, source_id, 15);
+        g_events_count++;
+        changed = true;
+    }
+    // 2. Sinon, on remplace le plus petit si le nouveau est plus fort
+    else {
+        int min_idx = 0;
+        float min_val = g_top_10_events[0].rms_value;
+        for(int i=1; i<MAX_STORED_EVENTS; i++){
+            if(g_top_10_events[i].rms_value < min_val){
+                min_val = g_top_10_events[i].rms_value;
+                min_idx = i;
+            }
+        }
+        if(rms > min_val){
+            g_top_10_events[min_idx].rms_value = rms;
+            g_top_10_events[min_idx].timestamp = HAL_GetTick();
+            strncpy(g_top_10_events[min_idx].source_id, source_id, 15);
+            changed = true;
+        }
+    }
+
+    // SI CHANGEMENT - On réveille le Gatekeeper (Tâche Stockage)
+    if (changed) {
+        osSemaphoreRelease(h_StorageSemaphore);
+    }
+    osMutexRelease(h_Top10Mutex);
+}
+
+
+
+/* 8. Tâche Stockage (Gatekeeper pour la FRAM) */
+void Start_Task_Storage(void const * argument)
+{
+    // 1. Initialisation : Charger les données au démarrage
+    FRAM_CS_Deselect();
+    osDelay(10); // Laisser la FRAM démarrer
+
+    osMutexWait(h_Top10Mutex, osWaitForever);
+    Load_Top10_From_FRAM();
+    log_to_uart("STORAGE: Loaded %d events.", g_events_count);
+    osMutexRelease(h_Top10Mutex);
+
+    for(;;)
+    {
+        // 2. ATTENTE : On dort jusqu'à ce que update_top_10_events() nous réveille
+        osSemaphoreWait(h_StorageSemaphore, osWaitForever);
+
+        // 3. ACTION : Sauvegarde lente en SPI
+        log_to_uart("STORAGE: Saving to FRAM...");
+
+        osMutexWait(h_Top10Mutex, osWaitForever);
+        Save_Top10_To_FRAM(); // Fonction définie plus haut
+        osMutexRelease(h_Top10Mutex);
+    }
+}
+
+
+
+
+
+
 /* --- Placeholder Tasks (Boucles vides) --- */
 void Start_Task_TimeSync(void const * argument)     { for(;;) { osDelay(1000); } }
-void Start_Task_Storage(void const * argument)      { for(;;) { osDelay(1000); } }
 
 
 
