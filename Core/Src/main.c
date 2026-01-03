@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+
 /* LWIP includes */
 #include "lwip/udp.h"
 #include "lwip/dns.h"
@@ -26,6 +27,8 @@
 #include "lwip/netif.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include <time.h>
+#include "lwip/apps/sntp.h"
 
 extern struct netif gnetif;
 /* USER CODE END Includes */
@@ -55,6 +58,8 @@ typedef struct {
 
 #define V_REF 3.3f           // Tension de référence ADC (Vref)
 #define ADC_MAX_VAL 4095.0f  // Valeur maximale 12 bits
+
+#define NTP_SERVER_IP "162.159.200.1"
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,6 +83,14 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 
+#define RTC_ADDR 0xD0
+char g_iso_timestamp[30] = "2026-01-02T00:00:00Z";
+#define NTP_PORT 123
+#define NTP_MSG_LEN 48
+#define NTP_TIMESTAMP_DELTA 2208988800u
+
+volatile uint8_t ntp_synced = 0;
+struct udp_pcb *ntp_pcb = NULL;
 
 /* --- Global System Flags --- */
 
@@ -187,6 +200,7 @@ void presence_broadcast(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 /* USER CODE END 0 */
 
 /**
@@ -270,31 +284,31 @@ int main(void)
   osThreadDef(TaskHeart, Start_Task_Heartbeat, osPriorityNormal, 0, 128);
   h_TaskHeartbeat = osThreadCreate(osThread(TaskHeart), NULL);
 
-  osThreadDef(TaskDebug, Start_Task_DebugUART, osPriorityBelowNormal, 0, 256);
+  osThreadDef(TaskDebug, Start_Task_DebugUART, osPriorityBelowNormal, 0, 512);
   h_TaskDebugUART = osThreadCreate(osThread(TaskDebug), NULL);
 
   // 3. Tâches Acquisition
-  osThreadDef(TaskAcq, Start_Task_Acquisition, osPriorityNormal, 0, 256);
+  osThreadDef(TaskAcq, Start_Task_Acquisition, osPriorityNormal, 0, 512);
   h_TaskAcquisition = osThreadCreate(osThread(TaskAcq), NULL);
 
   osThreadDef(TaskProc, Start_Task_Processing, osPriorityNormal, 0, 1024);
   h_TaskProcessing = osThreadCreate(osThread(TaskProc), NULL);
 
   // 4. Tâches Stockage/Temps (Placeholders)
-  osThreadDef(TaskTime, Start_Task_TimeSync, osPriorityBelowNormal, 0, 128);
+  osThreadDef(TaskTime, Start_Task_TimeSync, osPriorityBelowNormal, 0, 2024);
   h_TaskTimeSync = osThreadCreate(osThread(TaskTime), NULL);
 
-  osThreadDef(TaskStore, Start_Task_Storage, osPriorityLow, 0, 128);
+  osThreadDef(TaskStore, Start_Task_Storage, osPriorityLow, 0, 1024);
   h_TaskStorage = osThreadCreate(osThread(TaskStore), NULL);
 
   // 5. Tâches Réseau
-  osThreadDef(TaskBcast, Start_Task_Net_Broadcast, osPriorityBelowNormal, 0, 256);
+  osThreadDef(TaskBcast, Start_Task_Net_Broadcast, osPriorityBelowNormal, 0, 2024);
   h_TaskNetBroadcast = osThreadCreate(osThread(TaskBcast), NULL);
 
-  osThreadDef(TaskServ, Start_Task_Net_Server, osPriorityAboveNormal, 0, 1024);
+  osThreadDef(TaskServ, Start_Task_Net_Server, osPriorityAboveNormal, 0, 2024);
   h_TaskNetServer = osThreadCreate(osThread(TaskServ), NULL);
 
-  osThreadDef(TaskCli, Start_Task_Net_Client, osPriorityNormal, 0, 770);
+  osThreadDef(TaskCli, Start_Task_Net_Client, osPriorityNormal, 0, 2024);
   h_TaskNetClient = osThreadCreate(osThread(TaskCli), NULL);
 
 
@@ -320,6 +334,7 @@ int main(void)
   /* Start scheduler */
   osKernelStart();
 
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -750,6 +765,144 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+
+
+// --- OUTILS RTC BQ32000 ---
+
+/* USER CODE BEGIN 4 */
+
+// --- 1. CALLBACK DE RECEPTION NTP  ---
+void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
+{
+    if (p != NULL && p->tot_len >= 48)
+    {
+        uint8_t *payload = (uint8_t *)p->payload;
+
+        // Extraction du timestamp (octets 40 à 43)
+        uint32_t ntp_seconds = (payload[40] << 24) | (payload[41] << 16) | (payload[42] << 8) | payload[43];
+
+        // Conversion NTP (1900) vers UNIX (1970)
+        uint32_t unix_time = ntp_seconds - NTP_TIMESTAMP_DELTA;
+
+        // Conversion en structure de date complète (Année, Mois, Jour...)
+        struct tm *time_info;
+        time_t raw_time = (time_t)unix_time;
+        time_info = gmtime(&raw_time);
+
+        // Mise à jour de la RTC Physique BQ32000
+        RTC_SetTime(time_info);
+
+        ntp_synced = 1; // VICTOIRE !
+        log_to_uart(" NTP SYNC OK! Date: %04d-%02d-%02d", time_info->tm_year + 1900, time_info->tm_mon+1, time_info->tm_mday);
+    }
+
+    pbuf_free(p);
+    if (pcb != NULL) {
+        udp_remove(pcb);
+        ntp_pcb = NULL;
+    }
+}
+
+// --- 2. FONCTION D'ENVOI NTP MANUEL ---
+void Sync_Time_NTP_Manual(void)
+{
+    struct pbuf *p;
+    ip_addr_t dest_ip;
+    err_t err;
+
+    // Nettoyage si un ancien essai traîne
+    if (ntp_pcb != NULL) {
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
+    }
+
+    // Création Socket UDP
+    ntp_pcb = udp_new();
+    if (!ntp_pcb) return;
+
+    // Configuration Callback
+    udp_recv(ntp_pcb, ntp_recv_callback, NULL);
+
+    ipaddr_aton("162.159.200.1", &dest_ip);
+
+    // Préparation du paquet
+    p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
+    if (!p) {
+        udp_remove(ntp_pcb);
+        return;
+    }
+    memset(p->payload, 0, NTP_MSG_LEN);
+    ((uint8_t*)p->payload)[0] = 0x1B; // Mode Client
+
+    // Envoi
+    err = udp_sendto(ntp_pcb, p, &dest_ip, NTP_PORT);
+    pbuf_free(p);
+
+    if (err == ERR_OK) {
+        log_to_uart("NTP: Request sent to 162.159.200.1...");
+    } else {
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
+    }
+}
+
+// Conversion BCD - Décimal [cite: 60, 62]
+uint8_t BCD_to_Decimal(uint8_t bcd) {
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+// Conversion Décimal - BCD (Nécessaire pour écrire l'heure NTP dans la RTC)
+uint8_t Decimal_to_BCD(uint8_t decimal) {
+    return (((decimal / 10) << 4) | (decimal % 10));
+}
+
+
+// --- OUTILS RTC BQ32000 ---
+
+
+// Lecture Sécurisée
+bool RTC_GetTime(struct tm *time_info) {
+    uint8_t buffer[7];
+    memset(time_info, 0, sizeof(struct tm)); // Reset RAM
+
+    if (HAL_I2C_Mem_Read(&hi2c1, RTC_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT, buffer, 7, 100) == HAL_OK) {
+
+        // Si on lit 0xFF partout, le bus I2C est planté -> on ignore
+        if(buffer[0] == 0xFF && buffer[6] == 0xFF) return false;
+
+        time_info->tm_sec  = BCD_to_Decimal(buffer[0] & 0x7F); // Important : Masque 0x7F
+        time_info->tm_min  = BCD_to_Decimal(buffer[1]);
+        time_info->tm_hour = BCD_to_Decimal(buffer[2]);
+        // Reg 3 = Jour semaine
+        time_info->tm_mday = BCD_to_Decimal(buffer[4]);
+        time_info->tm_mon  = BCD_to_Decimal(buffer[5]) - 1;
+        time_info->tm_year = BCD_to_Decimal(buffer[6]) + 100; // +100 car tm_year commence en 1900
+
+        // Filtre anti-date absurde (2165 = tm_year 265)
+        if (time_info->tm_year > 150) return false;
+
+        return true;
+    }
+    return false;
+}
+
+// Ecriture
+void RTC_SetTime(struct tm *time_info) {
+    uint8_t buffer[7];
+    buffer[0] = Decimal_to_BCD(time_info->tm_sec);
+    buffer[1] = Decimal_to_BCD(time_info->tm_min);
+    buffer[2] = Decimal_to_BCD(time_info->tm_hour);
+    buffer[3] = Decimal_to_BCD(time_info->tm_wday == 0 ? 7 : time_info->tm_wday);
+    buffer[4] = Decimal_to_BCD(time_info->tm_mday);
+    buffer[5] = Decimal_to_BCD(time_info->tm_mon + 1);
+    buffer[6] = Decimal_to_BCD(time_info->tm_year % 100); // On écrit juste "25" pour 2025
+
+    HAL_I2C_Mem_Write(&hi2c1, RTC_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT, buffer, 7, 100);
+}
+
+
+
 /* ======================= USER HELPERS ======================= */
 void log_to_uart(const char *format, ...)
 {
@@ -765,6 +918,62 @@ void log_to_uart(const char *format, ...)
 }
 
 /* ======================= TASK IMPLEMENTATIONS ======================= */
+
+/* 6. Tâche Synchronisation Temps (NTP + RTC) */
+/* 6. Tâche Synchronisation Temps (NTP + RTC) */
+void Start_Task_TimeSync(void const * argument)
+{
+    // 1. Attente Réseau
+    while (!netif_is_up(&gnetif) || ip_addr_isany(&gnetif.ip_addr)) {
+        osDelay(1000);
+    }
+
+    // Initialisation valeur par défaut propre
+    snprintf(g_iso_timestamp, sizeof(g_iso_timestamp), "2000-01-01T00:00:00Z");
+
+    log_to_uart("TIME: Network OK. Starting Manual NTP...");
+
+    struct tm time_struct;
+    int retry_count = 0;
+
+    // 2. BOUCLE DE SYNCHRO NTP ( Bloquante au démarrage)
+    // On insiste tant qu'on n'a pas reçu l'heure (ntp_synced passe à 1 dans le callback)
+    while (ntp_synced == 0) {
+
+        Sync_Time_NTP_Manual(); // Envoi la demande UDP brute
+
+        // On attend la réponse pendant 5 secondes (50 x 100ms)
+        for(int i=0; i<50; i++) {
+            osDelay(100);
+            if(ntp_synced) break; // Si le callback a mis le flag à 1, on sort
+        }
+
+        if(ntp_synced == 0) {
+            retry_count++;
+            log_to_uart("TIME: No response, retrying (%d)...", retry_count);
+        }
+    }
+
+    log_to_uart("TIME: Sync Complete! Entering main loop.");
+
+    // 3. Boucle principale : Mise à jour de la variable globale g_iso_timestamp
+    for(;;)
+    {
+        // On lit la RTC physique (qui a été mise à l'heure par le NTP)
+        if (RTC_GetTime(&time_struct)) {
+            snprintf(g_iso_timestamp, sizeof(g_iso_timestamp),
+                     "%04d-%02d-%02d T %02d:%02d:%02d",
+                     time_struct.tm_year + 1900,
+                     time_struct.tm_mon + 1,
+                     time_struct.tm_mday,
+                     time_struct.tm_hour + 1,
+                     time_struct.tm_min,
+                     time_struct.tm_sec);
+        }
+
+        osDelay(1000);
+    }
+}
 
 /* 1. Tâche Maître (Gère le bouton) */
 void Start_Task_Master(void const * argument)
@@ -916,9 +1125,9 @@ void send_presence_broadcast(void)
         " \"type\": \"presence\",\n"
         " \"id\": \"nucleo-Ahmed\",\n"
         " \"ip\": \"%s\",\n"
-        " \"timestamp\": \"%lu\"\n"
+        " \"timestamp\": \"%s\"\n"
         "}",
-        my_ip, HAL_GetTick());
+        my_ip, g_iso_timestamp);
 
     // 4. Envoi
     p = pbuf_alloc(PBUF_TRANSPORT, strlen(msg), PBUF_RAM);
@@ -989,10 +1198,8 @@ void Start_Task_Processing(void const * argument)
         }
 
         // B. Consensus (ALARME GENERALE)
-        // Condition : MOI (Local) ET LUI (Peer) on tremble en même temps
         bool condition_consensus = g_local_shake_detected && g_peer_shake_detected;
 
-        // Vérifions que l'info du voisin n'est pas périmée (>2s)
         if (g_peer_shake_detected && (HAL_GetTick() - g_last_peer_shake_time > 2000)) {
             g_peer_shake_detected = false; // Info trop vieille
             condition_consensus = false;
@@ -1013,7 +1220,7 @@ void Start_Task_Processing(void const * argument)
             HAL_GPIO_WritePin(GPIOB, alarme_Pin, GPIO_PIN_RESET); // LED ROUGE OFF
 
             if (alarm_active_state) {
-                // L'alarme est finie, on relance le coeur
+                // L'alarme est finie, on relance le BEAT
                 vTaskResume(h_TaskHeartbeat);
                 alarm_active_state = false;
                 log_to_uart("Systeme Stabilise - Reprise");
@@ -1089,7 +1296,7 @@ void Start_Task_Net_Server(void const * argument)
                         "{\n"
                         " \"type\": \"data_response\",\n"
                         " \"id\": \"nucleo-Ahmed\",\n"
-                        " \"timestamp\": \"%lu\",\n"
+                        " \"timestamp\": \"%s\",\n"
                         " \"acceleration\": {\n"
                         "   \"x\": %.2f,\n"
                         "   \"y\": %.2f,\n"
@@ -1097,7 +1304,7 @@ void Start_Task_Net_Server(void const * argument)
                         " },\n"
                         " \"status\": \"%s\"\n"
                         "}",
-                        HAL_GetTick(),
+						g_iso_timestamp,
                         my_x, my_y, my_z,
                         (g_accel_rms_1s > 0.05f) ? "alert" : "normal"
                     );
@@ -1117,7 +1324,6 @@ void Start_Task_Net_Server(void const * argument)
 }
 
 
-/* Structure pour stocker les infos des collègues */
 typedef struct {
     char* name;
     char* id;
@@ -1130,12 +1336,12 @@ void Start_Task_Net_Client(void const * argument)
     Peer_t peers[] = {
     		//{"Kate",     "nucleo-6",  "192.168.129.72"},
     		//  {"Arthur",   "nucleo-14", "192.168.1.185"},
-    		 //{"Ilya",     "nucleo-8",  "192.168.129.181"},
+    		 {"Ilya",     "nucleo-8",  "192.168.129.181"},
     		//  {"Maxime",   "nucleo-3",  "192.168.1.183"},
     		//   {"Charles",  "nucleo-20", "192.168.1.151"},
     		//   {"Marvin",   "nucleo-12", "192.168.1.191"},
-    		//   {"Ethan",    "nucleo-22", "192.168.1.222"},
-       {"PC_Sim",   "pc-debug",  "192.168.1.50"}
+    		  // {"Nico",    "nucleo-11", "192.168.129.190"},
+       {"PC_Sim",   "pc-debug",  "192.168.129.1"}
     };
 
     int num_peers = sizeof(peers) / sizeof(peers[0]);
@@ -1163,7 +1369,7 @@ void Start_Task_Net_Client(void const * argument)
                 continue;
             }
 
-            // Configuration du timeout de réception (important si le collègue ne répond pas)
+            // Configuration du timeout de réception
             struct timeval tv;
             tv.tv_sec = 2;   // 2 secondes max d'attente pour la réponse
             tv.tv_usec = 0;
@@ -1179,7 +1385,7 @@ void Start_Task_Net_Client(void const * argument)
 
             // 3. Connexion (Connect)
             if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-                // Echec connexion (Normal si le collègue n'est pas là)
+                // Echec connexion
                  log_to_uart("CLI: %s Unreachable", peers[i].name);
                 close(sock);
                 osDelay(100); // Petite pause avant le suivant
@@ -1195,7 +1401,7 @@ void Start_Task_Net_Client(void const * argument)
                 " \"timestamp\": \"%lu\"\n"
                 "}",
                 peers[i].id,
-                HAL_GetTick());
+				g_iso_timestamp);
 
             // 5. Envoi
             if (send(sock, tx_buffer, len, 0) < 0) {
@@ -1389,8 +1595,36 @@ void Start_Task_Storage(void const * argument)
 
 
 
+
+// --- GESTION DU TEMPS SYSTEME ---
+#include <sys/time.h>
+
+// Variable globale pour stocker la différence entre l'heure NTP et le Tick système
+static time_t g_time_offset = 0;
+
+// Appelée par "time(NULL)"
+int _gettimeofday(struct timeval *tv, void *tzvp)
+{
+    uint32_t t = HAL_GetTick();
+    // On ajoute l'offset (qui sera 0 tant que NTP n'a pas répondu)
+    tv->tv_sec = (t / 1000) + g_time_offset;
+    tv->tv_usec = (t % 1000) * 1000;
+    return 0;
+}
+
+// Appelée par SNTP (LwIP) quand il reçoit l'heure
+int _settimeofday(const struct timeval *tv, const struct timezone *tz)
+{
+    uint32_t t = HAL_GetTick();
+    // On calcule la différence entre l'heure reçue et le temps système actuel
+    g_time_offset = tv->tv_sec - (t / 1000);
+    return 0;
+}
+
+
+
+
 /* --- Placeholder Tasks (Boucles vides) --- */
-void Start_Task_TimeSync(void const * argument)     { for(;;) { osDelay(1000); } }
 
 
 
