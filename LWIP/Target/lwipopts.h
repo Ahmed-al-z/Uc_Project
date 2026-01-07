@@ -56,8 +56,12 @@
 #define LWIP_DNS 1
 /*----- Value in opt.h for MEM_ALIGNMENT: 1 -----*/
 #define MEM_ALIGNMENT 4
+/*----- Default Value for MEM_SIZE: 1600 ---*/
+#define MEM_SIZE 32768
 /*----- Default Value for F7 devices: 0x20048000 -----*/
 #define LWIP_RAM_HEAP_POINTER 0x20048000
+/*----- Default Value for MEMP_NUM_TCP_PCB_LISTEN: 8 ---*/
+#define MEMP_NUM_TCP_PCB_LISTEN 20
 /*----- Value in opt.h for LWIP_ETHERNET: LWIP_ARP || PPPOE_SUPPORT -*/
 #define LWIP_ETHERNET 1
 /*----- Default Value for IP_SOF_BROADCAST: 0 ---*/
@@ -79,7 +83,7 @@
 /*----- Value in opt.h for LWIP_NETIF_LINK_CALLBACK: 0 -----*/
 #define LWIP_NETIF_LINK_CALLBACK 1
 /*----- Value in opt.h for TCPIP_THREAD_STACKSIZE: 0 -----*/
-#define TCPIP_THREAD_STACKSIZE 1024
+#define TCPIP_THREAD_STACKSIZE 8096
 /*----- Value in opt.h for TCPIP_THREAD_PRIO: 1 -----*/
 #define TCPIP_THREAD_PRIO osPriorityNormal
 /*----- Value in opt.h for TCPIP_MBOX_SIZE: 0 -----*/
@@ -98,6 +102,8 @@
 #define DEFAULT_TCP_RECVMBOX_SIZE 6
 /*----- Value in opt.h for DEFAULT_ACCEPTMBOX_SIZE: 0 -----*/
 #define DEFAULT_ACCEPTMBOX_SIZE 6
+/*----- Default Value for LWIP_SO_RCVTIMEO: 0 ---*/
+#define LWIP_SO_RCVTIMEO 1
 /*----- Value in opt.h for RECV_BUFSIZE_DEFAULT: INT_MAX -----*/
 #define RECV_BUFSIZE_DEFAULT 2000000000
 /*----- Default Value for LWIP_SNTP: 0 ---*/
@@ -126,6 +132,23 @@
 #define CHECKSUM_CHECK_ICMP6 0
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
+
+ // --- AUGMENTATION DU BUFFER DE CONNEXIONS TCP ---
+
+ // Nombre max de PCBs (Protocol Control Blocks) = Nombre de connexions simultanées
+ // Défaut = 5. On passe à 20 pour absorber les TIME_WAIT et les clients multiples.
+ #undef MEMP_NUM_TCP_PCB
+ #define MEMP_NUM_TCP_PCB 20
+
+ // Nombre de segments TCP en attente
+ // Défaut = 16. Il faut augmenter ceci car on a plus de connexions.
+ #undef MEMP_NUM_TCP_SEG
+ #define MEMP_NUM_TCP_SEG 40
+
+ // Optionnel : Nombre de timeouts système (pour la gestion interne LwIP)
+ #undef MEMP_NUM_SYS_TIMEOUT
+ #define MEMP_NUM_SYS_TIMEOUT 10
+
 
 /* USER CODE END 1 */
 

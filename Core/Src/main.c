@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body - REFACTORED ETAPE 1
+  * @brief
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -42,9 +42,12 @@ typedef struct {
 
 
 typedef struct {
-    float rms_value;       // Valeur de la secousse
-    uint32_t timestamp;    // Quand c'est arrivé
-    char source_id[16];
+    float mag;             // Magnitude (pour le tri)
+    float x;               // Valeur X
+    float y;               // Valeur Y
+    float z;               // Valeur Z
+    char  iso_date[24];    // Date
+    char  source_id[16];   // ID
 } SeismicEvent_t;
 
 
@@ -52,7 +55,7 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ACCEL_SAMPLES_PER_AXIS_WINDOW_MS 10 // Nombre d'échantillons X,Y,Z reçus tous les 100ms
+#define ACCEL_SAMPLES_PER_AXIS_WINDOW_MS 10 // Nombre d'échantillons X,Y,Z
 #define WINDOW_MS_IN_S 10                  // 10 x 100ms = 1s
 #define ACCEL_SAMPLES_1S (ACCEL_SAMPLES_PER_AXIS_WINDOW_MS * WINDOW_MS_IN_S) // 100 échantillons/axe pour 1s
 
@@ -131,16 +134,16 @@ osMailQId  h_LogQueue;          // Queue pour les messages UART
 
 /* 2. Tâches Acquisition & Métier */
 osThreadId h_TaskAcquisition;   // Tâche Acquisition (ADC DMA)
-osThreadId h_TaskProcessing;    // Tâche Traitement (Safety/Sismique - Placeholder Step 2)
+osThreadId h_TaskProcessing;    // Tâche Traitement
 
-/* 3. Tâches Stockage & Temps (Placeholder Step 3) */
+/* 3. Tâches Stockage & Temps */
 osThreadId h_TaskTimeSync;
 osThreadId h_TaskStorage;
 
 /* 4. Tâches Réseau */
 osThreadId h_TaskNetBroadcast;  // Tâche Broadcast (UDP)
-osThreadId h_TaskNetServer;     // Serveur (Placeholder Step 2)
-osThreadId h_TaskNetClient;     // Client (Placeholder Step 2)
+osThreadId h_TaskNetServer;     // Serveur
+osThreadId h_TaskNetClient;     // Client
 
 
 osSemaphoreId h_StorageSemaphore; // Le réveil pour la tâche stockage
@@ -271,7 +274,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
 
-  /* Creation manuelle des tâches avec NOUVEAUX NOMS */
+  /* Creation des tâches */
 
   // 1. Queue de Log
   osMailQDef(logQ, 16, LogMessage_t);
@@ -291,14 +294,14 @@ int main(void)
   osThreadDef(TaskAcq, Start_Task_Acquisition, osPriorityNormal, 0, 512);
   h_TaskAcquisition = osThreadCreate(osThread(TaskAcq), NULL);
 
-  osThreadDef(TaskProc, Start_Task_Processing, osPriorityNormal, 0, 1024);
+  osThreadDef(TaskProc, Start_Task_Processing, osPriorityBelowNormal, 0, 1024);
   h_TaskProcessing = osThreadCreate(osThread(TaskProc), NULL);
 
-  // 4. Tâches Stockage/Temps (Placeholders)
+  // 4. Tâches Stockage/Temps
   osThreadDef(TaskTime, Start_Task_TimeSync, osPriorityBelowNormal, 0, 2024);
   h_TaskTimeSync = osThreadCreate(osThread(TaskTime), NULL);
 
-  osThreadDef(TaskStore, Start_Task_Storage, osPriorityLow, 0, 1024);
+  osThreadDef(TaskStore, Start_Task_Storage, osPriorityBelowNormal, 0, 1024);
   h_TaskStorage = osThreadCreate(osThread(TaskStore), NULL);
 
   // 5. Tâches Réseau
@@ -767,6 +770,35 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 
+/* USER CODE BEGIN 4 */
+
+/**
+ * @brief Lit le contenu de la FRAM et l'affiche sur l'UART
+ */
+void CMD_Read_FRAM_Content(void)
+{
+    log_to_uart("=== ETAT MEMOIRE FRAM ===");
+    if (g_events_count == 0) {
+        log_to_uart(" > Vide.");
+    }
+    else {
+        for (int i = 0; i < g_events_count; i++) {
+            // Affichage détaillé : Date | Source | X | Y | Z
+            log_to_uart(" #%d | %s | %-10s | X:%.2f Y:%.2f Z:%.2f", //(Mag:%.2f)",
+                        i + 1,
+                        g_top_10_events[i].iso_date,
+                        g_top_10_events[i].source_id,
+                        g_top_10_events[i].x,
+                        g_top_10_events[i].y,
+                        g_top_10_events[i].z,
+                        g_top_10_events[i].mag);
+        }
+    }
+    log_to_uart("=========================");
+}
+
+
+
 
 // --- OUTILS RTC BQ32000 ---
 
@@ -868,7 +900,7 @@ bool RTC_GetTime(struct tm *time_info) {
 
     if (HAL_I2C_Mem_Read(&hi2c1, RTC_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT, buffer, 7, 100) == HAL_OK) {
 
-        // Si on lit 0xFF partout, le bus I2C est planté -> on ignore
+        // Si on lit 0xFF partout, le bus I2C est planté - on ignore
         if(buffer[0] == 0xFF && buffer[6] == 0xFF) return false;
 
         time_info->tm_sec  = BCD_to_Decimal(buffer[0] & 0x7F); // Important : Masque 0x7F
@@ -879,7 +911,7 @@ bool RTC_GetTime(struct tm *time_info) {
         time_info->tm_mon  = BCD_to_Decimal(buffer[5]) - 1;
         time_info->tm_year = BCD_to_Decimal(buffer[6]) + 100; // +100 car tm_year commence en 1900
 
-        // Filtre anti-date absurde (2165 = tm_year 265)
+        // Filtre date absurde (2165 = tm_year 265)
         if (time_info->tm_year > 150) return false;
 
         return true;
@@ -903,7 +935,7 @@ void RTC_SetTime(struct tm *time_info) {
 
 
 
-/* ======================= USER HELPERS ======================= */
+/* =======================  gate keeper ======================= */
 void log_to_uart(const char *format, ...)
 {
     LogMessage_t *msg = osMailAlloc(h_LogQueue, 0);
@@ -919,7 +951,12 @@ void log_to_uart(const char *format, ...)
 
 /* ======================= TASK IMPLEMENTATIONS ======================= */
 
-/* 6. Tâche Synchronisation Temps (NTP + RTC) */
+
+
+
+
+/* ======================= TASK NTP ======================= */
+
 /* 6. Tâche Synchronisation Temps (NTP + RTC) */
 void Start_Task_TimeSync(void const * argument)
 {
@@ -975,31 +1012,45 @@ void Start_Task_TimeSync(void const * argument)
     }
 }
 
-/* 1. Tâche Maître (Gère le bouton) */
+/* ======================= TASK NTP ======================= */
+
+
+/* ======================= TASK master ======================= */
+
+
+/* 1. Tâche Maître (Gère le bouton et la surveillance périodique) */
 void Start_Task_Master(void const * argument)
 {
-	static bool running = true;
-	static bool lastButtonState = false;
+    // Petite pause au démarrage pour laisser le système s'initialiser
+    osDelay(5000);
 
     for(;;) {
-    	bool currentButton = g_user_button_pressed;
+        // 1. On dort pendant 20 secondes (20000 ms)
+        osDelay(20000);
 
-    	if(currentButton && !lastButtonState){ // Toggle
-    		if(!running){
-				vTaskResume(h_TaskHeartbeat);
-				log_to_uart("CMD: System RESUMED");
-				running = true;
-			}
-    		else{
-    			vTaskSuspend(h_TaskHeartbeat);
-				log_to_uart("CMD: System SUSPENDED");
-				running = false;
-			}
-    	}
-    	lastButtonState = currentButton;
-    	osDelay(20); // Debounce
+        log_to_uart("--- AUTO-CHECK: LECTURE FRAM (20s) ---");
+
+        // 2. On prend le Mutex (très important !)
+        // Cela empêche de lire si la tâche Storage est en train d'écrire un séisme au même moment
+        osMutexWait(h_Top10Mutex, osWaitForever);
+
+        // 3. On recharge les données depuis la puce FRAM physique via SPI
+        // Cela garantit qu'on affiche ce qui est réellement sur la puce, pas juste la copie RAM
+        Load_Top10_From_FRAM();
+
+        // 4. On affiche le tableau
+        CMD_Read_FRAM_Content();
+
+        // 5. On libère le Mutex pour laisser les autres travailler
+        osMutexRelease(h_Top10Mutex);
     }
 }
+
+
+/* ======================= TASK master ======================= */
+
+/* ======================= TASK heart beat ======================= */
+
 
 /* 2. Tâche Heartbeat */
 void Start_Task_Heartbeat(void const * argument)
@@ -1009,6 +1060,12 @@ void Start_Task_Heartbeat(void const * argument)
     	osDelay(400);
     }
 }
+
+
+/* ======================= TASK heart beat ======================= */
+
+
+/* ======================= TASK  uart gate keeper ======================= */
 
 /* 3. Tâche Debug UART */
 void Start_Task_DebugUART(void const * argument)
@@ -1025,6 +1082,9 @@ void Start_Task_DebugUART(void const * argument)
         }
     }
 }
+
+/* ======================= TASK  acque adxl ======================= */
+
 
 /* 4. Tâche Acquisition (ADC) */
 void Start_Task_Acquisition(void const * argument)
@@ -1070,6 +1130,10 @@ void Start_Task_Acquisition(void const * argument)
         osDelay(1); // La tâche ne doit pas monopoliser le CPU
     }
 }
+/* ======================= TASK  acque adxl ======================= */
+
+
+/* ======================= TASK broadcast ======================= */
 
 
 /* 5. Tâche Broadcast (UDP) */
@@ -1095,17 +1159,19 @@ void Start_Task_Net_Broadcast(void const * argument)
         osDelay(10000);
     }
 }
+/* ======================= TASK broadcast ======================= */
 
 
 /* USER CODE BEGIN 4 */
 
-//le unicast fonctionnait mais pas le broadcast car lwip bloque le broadcast donc il fallait ajouter : ip_set_option(pcb, SOF_BROADCAST);
+/* ======================= fonction broadcast ======================= */
+
 /* Fonction send_presence_broadcast    */
 void send_presence_broadcast(void)
 {
     struct udp_pcb *pcb;
     struct pbuf *p;
-    err_t err;
+   // err_t err;
     char msg[256];
     char my_ip[16];
 
@@ -1142,6 +1208,15 @@ void send_presence_broadcast(void)
 
     udp_remove(pcb);
 }
+
+
+
+
+/* ======================= fonction broadcast ======================= */
+
+
+
+/* ======================= task precess adxl ======================= */
 
 /* 7. Tâche Traitement (Seismic processing + Consensus) */
 void Start_Task_Processing(void const * argument)
@@ -1188,6 +1263,9 @@ void Start_Task_Processing(void const * argument)
             // SAUVEGARDE FRAM (Top 10)
             update_top_10_events(g_accel_rms_1s, "local");
 
+            log_to_uart("!!!  - 10 event loc ok !!!");
+
+
             HAL_GPIO_TogglePin(GPIOB, LD2_Pin);
         } else {
             // Reset après 2s
@@ -1198,7 +1276,7 @@ void Start_Task_Processing(void const * argument)
         }
 
         // B. Consensus (ALARME GENERALE)
-        bool condition_consensus = g_local_shake_detected && g_peer_shake_detected;
+        bool condition_consensus = g_peer_shake_detected; //g_local_shake_detected && g_peer_shake_detected;
 
         if (g_peer_shake_detected && (HAL_GetTick() - g_last_peer_shake_time > 2000)) {
             g_peer_shake_detected = false; // Info trop vieille
@@ -1229,6 +1307,11 @@ void Start_Task_Processing(void const * argument)
     }
 }
 
+/* ======================= task precess adxl ======================= */
+
+
+/* ======================= task reponse requete ======================= */
+
 /* 8. Tâche Serveur TCP (Répond aux requêtes) */
 void Start_Task_Net_Server(void const * argument)
 {
@@ -1251,9 +1334,9 @@ void Start_Task_Net_Server(void const * argument)
     }
 
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
+    server_addr.sin_family = AF_INET; //ipv4
     server_addr.sin_port = htons(12345);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_addr.s_addr = INADDR_ANY; //ecoute tout sur mon ip
 
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         log_to_uart("SRV: Error binding");
@@ -1269,24 +1352,24 @@ void Start_Task_Net_Server(void const * argument)
 
     for(;;)
     {
-        client_addr_len = sizeof(client_addr);
+        client_addr_len = sizeof(client_addr); //id client
         // Accept est bloquant
         client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_addr_len);
 
-        if (client_sock >= 0) {
+        if (client_sock >= 0) { //si client connecté
 
-            memset(rx_buffer, 0, sizeof(rx_buffer));
+            memset(rx_buffer, 0, sizeof(rx_buffer)); // prepa buff rx
             // On laisse 100ms max pour recevoir la donnée (évite un blocage infini si le client n'envoie rien)
-            struct timeval tv;
+            struct timeval tv; // si je recoir rien  j'attend un peu puis abandonne
             tv.tv_sec = 0;
             tv.tv_usec = 100000; // 100 ms
             setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
 
-            bytes_read = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+            bytes_read = recv(client_sock, rx_buffer, sizeof(rx_buffer) - 1, 0); //j'attend un msg et les stock rx buffer
 
-            if (bytes_read > 0) {
+            if (bytes_read > 0) { // si on a recu un msg
                 // Si c'est une requête valide
-                if (strstr(rx_buffer, "data_request") != NULL)
+                if (strstr(rx_buffer, "data_request") != NULL) // data reequest
                 {
                     float my_x = g_accel_mean_x;
                     float my_y = g_accel_mean_y;
@@ -1322,7 +1405,9 @@ void Start_Task_Net_Server(void const * argument)
         osDelay(10);
     }
 }
+/* ======================= task reponse requete ======================= */
 
+/* ======================= task demande requete ======================= */
 
 typedef struct {
     char* name;
@@ -1330,141 +1415,200 @@ typedef struct {
     char* ip;
 } Peer_t;
 
-/* 9. Tâche Client TCP (Interroge les autres cartes) */
+/* 9. Tâche Client TCP */
 void Start_Task_Net_Client(void const * argument)
 {
-    Peer_t peers[] = {
-    		//{"Kate",     "nucleo-6",  "192.168.129.72"},
-    		//  {"Arthur",   "nucleo-14", "192.168.1.185"},
-    		 {"Ilya",     "nucleo-8",  "192.168.129.181"},
-    		//  {"Maxime",   "nucleo-3",  "192.168.1.183"},
-    		//   {"Charles",  "nucleo-20", "192.168.1.151"},
-    		//   {"Marvin",   "nucleo-12", "192.168.1.191"},
-    		  // {"Nico",    "nucleo-11", "192.168.129.190"},
-       {"PC_Sim",   "pc-debug",  "192.168.129.1"}
-    };
+    /* --- CONFIGURATION --- */
+    #define MAX_DYNAMIC_PEERS 5
 
-    int num_peers = sizeof(peers) / sizeof(peers[0]);
-    int sock;
-    struct sockaddr_in server_addr;
-    char tx_buffer[256];
-    char rx_buffer[512];
-    int bytes_received;
+    typedef struct {
+        char id[32];
+        char ip[16];
+    } DynamicPeer_t;
 
-    // Attente lien réseau
-    while (!netif_is_up(&gnetif) || ip_addr_isany(&gnetif.ip_addr)) {
-        osDelay(1000);
+    /* --- VARIABLES STATIQUES (CRITIQUE : Ne pas mettre dans la Stack !) --- */
+    // On force l'alignement 4 bytes pour le DMA Ethernet du STM32F7
+    static DynamicPeer_t peers[MAX_DYNAMIC_PEERS];
+    static char buffer_echange[512] __attribute__((aligned(4)));
+
+    int num_peers = 0;
+    int tcp_sock = -1;
+    int udp_sock = -1;
+    struct sockaddr_in udp_local_addr;
+
+    /* --- ETAPE 1 : Attente Lien Physique --- */
+    log_to_uart("CLI: Waiting for Link...");
+    while (!netif_is_up(&gnetif)) {
+        osDelay(500);
     }
-    log_to_uart("CLI: Client Task Started. Scanning %d peers...", num_peers);
 
+    // Pause de sécurité pour laisser LwIP finir son init interne
+    osDelay(2000);
+    log_to_uart("CLI: Network UP. Starting Sockets...");
+
+    /* --- ETAPE 2 : Socket UDP (Découverte) --- */
+    udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        log_to_uart("CLI: FATAL - Cannot create UDP socket");
+        vTaskDelete(NULL);
+    }
+
+    int opt = 1;
+    setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+
+    // TIMEOUT DE RECEPTION (Obligatoire pour ne pas figer)
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000; // 100ms
+    setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    memset(&udp_local_addr, 0, sizeof(udp_local_addr));
+    udp_local_addr.sin_family = AF_INET;
+    udp_local_addr.sin_port   = htons(12345);
+    udp_local_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(udp_sock, (struct sockaddr *)&udp_local_addr, sizeof(udp_local_addr)) < 0) {
+        log_to_uart("CLI: Error binding UDP");
+        close(udp_sock);
+        vTaskDelete(NULL);
+    }
+
+    log_to_uart("CLI: Discovery Active. Scanning...");
+
+    /* --- BOUCLE INFINIE --- */
     for(;;)
     {
-        // On parcourt la liste des collègues
-        for (int i = 0; i < num_peers; i++)
-        {
-            // 1. Création Socket
-            sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock < 0) {
-                log_to_uart("CLI: Error creating socket");
-                continue;
+        /* --- A. ECOUTE UDP (Non bloquante grâce au timeout) --- */
+        // On lit max 3 paquets par boucle pour ne pas bloquer le CPU
+        for(int k=0; k<3; k++) {
+            struct sockaddr_in src_addr;
+            socklen_t addr_len = sizeof(src_addr);
+
+            int len = recvfrom(udp_sock, buffer_echange, sizeof(buffer_echange)-1, 0,
+                               (struct sockaddr *)&src_addr, &addr_len);
+
+            if(len > 0) {
+                buffer_echange[len] = 0; // Terminateur de chaîne
+
+                // Si c'est un message de présence
+                if(strstr(buffer_echange, "presence")) {
+                    char temp_id[32] = {0};
+                    char temp_ip[16] = {0};
+
+                    // Extraction manuelle (plus sûre que sscanf sur F7)
+                    char *ptr = strstr(buffer_echange, "\"id\": \"");
+                    if(ptr) sscanf(ptr + 7, "%31[^\"]", temp_id);
+
+                    ptr = strstr(buffer_echange, "\"ip\": \"");
+                    if(ptr) sscanf(ptr + 7, "%15[^\"]", temp_ip);
+
+                    // 1. On ignore notre propre IP (192.168.1.177)
+                    if(strstr(temp_ip, "192.168.1.177")) continue;
+
+                    // 2. On vérifie si on le connait déjà
+                    bool connu = false;
+                    for(int i=0; i<num_peers; i++) {
+                        if(strcmp(peers[i].ip, temp_ip) == 0) {
+                            connu = true;
+                            break;
+                        }
+                    }
+
+                    // 3. Ajout à la liste
+                    if(!connu && num_peers < MAX_DYNAMIC_PEERS) {
+                        strncpy(peers[num_peers].id, temp_id, 31);
+                        strncpy(peers[num_peers].ip, temp_ip, 15);
+                        num_peers++;
+                        log_to_uart("CLI: NEW FRIEND -> %s (%s)", temp_id, temp_ip);
+                    }
+                }
+            } else {
+                break; // Timeout atteint ou erreur, on sort de la boucle de lecture
             }
-
-            // Configuration du timeout de réception
-            struct timeval tv;
-            tv.tv_sec = 2;   // 2 secondes max d'attente pour la réponse
-            tv.tv_usec = 0;
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-
-            // 2. Configuration Adresse Cible
-            memset(&server_addr, 0, sizeof(server_addr));
-            server_addr.sin_family = AF_INET;
-            server_addr.sin_port = htons(12345); // Port standard du projet
-            server_addr.sin_addr.s_addr = inet_addr(peers[i].ip);
-
-            log_to_uart("CLI: Connecting to %s (%s)...", peers[i].name, peers[i].ip);
-
-            // 3. Connexion (Connect)
-            if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-                // Echec connexion
-                 log_to_uart("CLI: %s Unreachable", peers[i].name);
-                close(sock);
-                osDelay(100); // Petite pause avant le suivant
-                continue;
-            }
-
-            // 4. Préparation de la requête JSON
-            int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                "{\n"
-                " \"type\": \"data_request\",\n"
-                " \"from\": \"nucleo-Ahmed\",\n"
-                " \"to\": \"%s\",\n"
-                " \"timestamp\": \"%lu\"\n"
-                "}",
-                peers[i].id,
-				g_iso_timestamp);
-
-            // 5. Envoi
-            if (send(sock, tx_buffer, len, 0) < 0) {
-                log_to_uart("CLI: Send failed to %s", peers[i].name);
-                close(sock);
-                continue;
-            }
-
-            // 6. Réception de la réponse
-            memset(rx_buffer, 0, sizeof(rx_buffer));
-            bytes_received = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-
-            if (bytes_received > 0) {
-                            // log_to_uart("CLI: RECV from %s", peers[i].name);
-
-                            // --- ETAPE 3 : Analyse simple du JSON ---
-
-                            // 1. Chercher si le voisin est en alerte
-                            if (strstr(rx_buffer, "\"status\": \"alert\"") != NULL || strstr(rx_buffer, "\"alert\"") != NULL) {
-                                g_peer_shake_detected = true;
-                                g_last_peer_shake_time = HAL_GetTick();
-                                log_to_uart("CONSENSUS: Peer %s signals ALERT!", peers[i].name);
-                            }
-
-                            // 2. Chercher si le voisin envoie une forte vibration (pour le Top 10)
-                            char* pX = strstr(rx_buffer, "\"x\":");
-                            if(pX) {
-                                float val_x = 0;
-                                // Lecture un peu "brute" mais efficace
-                                if(sscanf(pX + 4, "%f", &val_x) == 1) {
-                                     // Si c'est fort (>0.1), on l'enregistre
-                                     if(val_x > 0.1f || val_x < -0.1f) {
-                                         update_top_10_events(fabs(val_x), peers[i].id);
-                                     }
-                                }
-                            }
-                        } else {
-                log_to_uart("CLI: No response from %s", peers[i].name);
-            }
-
-            // 7. Fermeture propre
-            close(sock);
-
-            osDelay(500);
         }
 
-        log_to_uart("CLI: Round finished. Waiting 5s...");
-        osDelay(20000);
+        osDelay(50); // Petite pause pour l'OS
+
+        /* --- B. INTERROGATION TCP (Si on a des amis) --- */
+        if (num_peers > 0) {
+            for (int i = 0; i < num_peers; i++) {
+
+                tcp_sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (tcp_sock < 0) continue; // Manque de RAM LwIP, on saute ce tour
+
+                // Timeout connexion TCP (1s max) - TRES IMPORTANT
+                struct timeval tcp_tv;
+                tcp_tv.tv_sec = 1;
+                tcp_tv.tv_usec = 0;
+                setsockopt(tcp_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tcp_tv, sizeof(tcp_tv));
+                setsockopt(tcp_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tcp_tv, sizeof(tcp_tv));
+
+                struct sockaddr_in dest_addr;
+                dest_addr.sin_family = AF_INET;
+                dest_addr.sin_port = htons(12345);
+                dest_addr.sin_addr.s_addr = inet_addr(peers[i].ip);
+
+                // Connexion
+                if (connect(tcp_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == 0) {
+
+                    // Envoi Requête JSON
+                    snprintf(buffer_echange, sizeof(buffer_echange),
+                        "{\"type\":\"data_request\",\"from\":\"nucleo-Ahmed\",\"to\":\"%s\"}", peers[i].id);
+                    send(tcp_sock, buffer_echange, strlen(buffer_echange), 0);
+
+                    // Réception Réponse
+                    int n = recv(tcp_sock, buffer_echange, sizeof(buffer_echange)-1, 0);
+                    if (n > 0) {
+                        buffer_echange[n] = 0;
+
+                        // 1. Check ALERTE
+                        if (strstr(buffer_echange, "alert") || strstr(buffer_echange, "status\": \"alert")) {
+                            g_peer_shake_detected = true;
+                            g_last_peer_shake_time = HAL_GetTick();
+                            log_to_uart("!!! ALERTE DU VOISIN %s !!!", peers[i].id);
+                        }
+
+                        // 2. Check Magnitude (pour Top 10)
+                        char *pX = strstr(buffer_echange, "\"x\":");
+                        if(pX) {
+                            float val = strtof(pX + 4, NULL);
+                            if(fabsf(val) > 0.1f) {
+                                // Appel à votre fonction de mise à jour du Top 10
+                                update_top_10_events(fabsf(val), val, 0, 0, peers[i].id);
+                            }
+                        }
+                    }
+                }
+
+                // FERMETURE OBLIGATOIRE
+                close(tcp_sock);
+
+                // Pause pour laisser LwIP nettoyer le socket
+                osDelay(50);
+            }
+        }
+
+        // Pause entre deux cycles complets de scan
+        osDelay(2000);
     }
 }
 
+/* ======================= task demande requete ======================= */
 
 
 
-
+/* ======================= task Fram ======================= */
 
 /* 8. Tâche Stockage (Gère la FRAM ) */
 
 // --- A. DRIVER FRAM (Mode Burst) ---
-// Adresses et commandes
+// --- DRIVER FRAM CY15B104Q ---
 #define FRAM_WREN  0x06
 #define FRAM_WRITE 0x02
 #define FRAM_READ  0x03
+#define FRAM_MAGIC_ADDR 0x001000
+#define MAGIC_NUMBER    0x0B00B1E5
 
 void FRAM_CS_Select(void) {
     HAL_GPIO_WritePin(FRAM_CS_GPIO_Port, FRAM_CS_Pin, GPIO_PIN_RESET);
@@ -1523,39 +1667,51 @@ void Load_Top10_From_FRAM(void) {
 
 // --- C. LOGIQUE TOP 10 ---
 // C'est cette fonction qui décide si on garde l'événement et qui réveille la tâche stockage
-void update_top_10_events(float rms, const char* source_id) {
-    if (rms < 0.05f) return; // Seuil minimum
+void update_top_10_events(float magnitude, float x, float y, float z, const char* source_id) {
+
+    // Filtre de sécurité basique
+    if (magnitude < 0.05f) return;
+
+    // On ignore les NAN/INF
+    if (isnan(magnitude) || isinf(magnitude)) return;
+
     bool changed = false;
 
-    osMutexWait(h_Top10Mutex, osWaitForever); // On protège la liste
+    osMutexWait(h_Top10Mutex, osWaitForever);
 
-    // 1. Ajout direct s'il y a de la place
+    volatile SeismicEvent_t* target_event = NULL;
+
+    // 1. Remplissage ou Remplacement (Même logique qu'avant)
     if (g_events_count < MAX_STORED_EVENTS) {
-        g_top_10_events[g_events_count].rms_value = rms;
-        g_top_10_events[g_events_count].timestamp = HAL_GetTick();
-        strncpy(g_top_10_events[g_events_count].source_id, source_id, 15);
+        target_event = &g_top_10_events[g_events_count];
         g_events_count++;
         changed = true;
     }
-    // 2. Sinon, on remplace le plus petit si le nouveau est plus fort
     else {
         int min_idx = 0;
-        float min_val = g_top_10_events[0].rms_value;
+        float min_val = g_top_10_events[0].mag;
         for(int i=1; i<MAX_STORED_EVENTS; i++){
-            if(g_top_10_events[i].rms_value < min_val){
-                min_val = g_top_10_events[i].rms_value;
+            if(g_top_10_events[i].mag < min_val){
+                min_val = g_top_10_events[i].mag;
                 min_idx = i;
             }
         }
-        if(rms > min_val){
-            g_top_10_events[min_idx].rms_value = rms;
-            g_top_10_events[min_idx].timestamp = HAL_GetTick();
-            strncpy(g_top_10_events[min_idx].source_id, source_id, 15);
+        if(magnitude > min_val){
+            target_event = &g_top_10_events[min_idx];
             changed = true;
         }
     }
 
-    // SI CHANGEMENT - On réveille le Gatekeeper (Tâche Stockage)
+    // 2. SAUVEGARDE DES VALEURS PRECISES
+    if (target_event != NULL) {
+        target_event->mag = magnitude;
+        target_event->x = x; // On sauvegarde X
+        target_event->y = y; // On sauvegarde Y
+        target_event->z = z; // On sauvegarde Z
+        strncpy((char*)target_event->iso_date, g_iso_timestamp, 23);
+        strncpy((char*)target_event->source_id, source_id, 15);
+    }
+
     if (changed) {
         osSemaphoreRelease(h_StorageSemaphore);
     }
@@ -1563,43 +1719,138 @@ void update_top_10_events(float rms, const char* source_id) {
 }
 
 
-
 /* 8. Tâche Stockage (Gatekeeper pour la FRAM) */
+// Fonction générique Ecriture
+/* USER CODE BEGIN 4 */
+
+// Fonction d'écriture blindée pour CY15B104Q
+void FRAM_Write(uint32_t address, uint8_t *pData, uint16_t size) {
+    uint8_t cmd[4];
+
+    // 1. WREN (Write Enable)
+    // C'est l'étape la plus critique : il faut dire à la puce "Prépare-toi à écrire"
+    FRAM_CS_Select();
+    cmd[0] = FRAM_WREN;
+    HAL_SPI_Transmit(&hspi2, &cmd[0], 1, 100);
+    FRAM_CS_Deselect();
+
+    // Petit délai indispensable pour que le verrou WREN s'enclenche
+    for(volatile int k=0; k<500; k++);
+
+    // 2. WRITE + ADDRESS
+    FRAM_CS_Select();
+    cmd[0] = FRAM_WRITE;
+    cmd[1] = (address >> 16) & 0xFF; // MSB
+    cmd[2] = (address >> 8)  & 0xFF;
+    cmd[3] = (address)       & 0xFF; // LSB
+
+    // On envoie la commande d'abord
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
+
+    // 3. DATA
+    // On envoie les données
+    HAL_SPI_Transmit(&hspi2, pData, size, 2000); // Timeout augmenté à 2s
+
+    FRAM_CS_Deselect();
+
+    // Petit délai après écriture pour stabilisation
+    for(volatile int k=0; k<500; k++);
+}
+
+// Fonction générique Lecture
+void FRAM_Read(uint32_t address, uint8_t *pData, uint16_t size) {
+    uint8_t cmd[4];
+    FRAM_CS_Select();
+    cmd[0] = FRAM_READ;
+    cmd[1] = (address >> 16) & 0xFF;
+    cmd[2] = (address >> 8)  & 0xFF;
+    cmd[3] = (address)       & 0xFF;
+
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);
+    HAL_SPI_Receive(&hspi2, pData, size, 1000);
+    FRAM_CS_Deselect();
+}
+
+// Fonction de Formatage (Remise à zéro)
+void FRAM_Format_Reset(void) {
+    log_to_uart("STORAGE: Formatting FRAM (First Boot or Corruption)...");
+
+    // 1. On remet le compteur à 0
+    g_events_count = 0;
+
+    // 2. On nettoie le tableau RAM
+    memset((void*)g_top_10_events, 0, sizeof(g_top_10_events));
+
+    // 3. On ecrit des 0 partout dans la zone Data de la FRAM
+    FRAM_Write(FRAM_STORAGE_ADDR, (uint8_t*)g_top_10_events, sizeof(g_top_10_events));
+
+    // 4. On écrit le compteur 0
+    FRAM_Write(FRAM_STORAGE_ADDR + sizeof(g_top_10_events), (uint8_t*)&g_events_count, 4);
+
+    // 5. On écrit le MAGIC NUMBER pour dire "C'est initialisé"
+    uint32_t magic = MAGIC_NUMBER;
+    FRAM_Write(FRAM_MAGIC_ADDR, (uint8_t*)&magic, 4);
+
+    log_to_uart("STORAGE: Format Complete.");
+}
+
+// --- TACHE STOCKAGE ---
 void Start_Task_Storage(void const * argument)
 {
-    // 1. Initialisation : Charger les données au démarrage
-    FRAM_CS_Deselect();
-    osDelay(10); // Laisser la FRAM démarrer
+    osDelay(100);
 
+    // --- INITIALISATION (Lecture au démarrage) ---
     osMutexWait(h_Top10Mutex, osWaitForever);
-    Load_Top10_From_FRAM();
-    log_to_uart("STORAGE: Loaded %d events.", g_events_count);
+    uint32_t magic_check = 0;
+    FRAM_Read(FRAM_MAGIC_ADDR, (uint8_t*)&magic_check, 4);
+
+    if (magic_check != MAGIC_NUMBER) {
+        FRAM_Format_Reset();
+    } else {
+        FRAM_Read(FRAM_STORAGE_ADDR, (uint8_t*)g_top_10_events, sizeof(g_top_10_events));
+        FRAM_Read(FRAM_STORAGE_ADDR + sizeof(g_top_10_events), (uint8_t*)&g_events_count, 4);
+        if(g_events_count > MAX_STORED_EVENTS) g_events_count = 0;
+    }
+
+    // On affiche le tableau COMPLET seulement au démarrage
+    CMD_Read_FRAM_Content();
     osMutexRelease(h_Top10Mutex);
 
+    // --- BOUCLE INFINIE ---
     for(;;)
     {
-        // 2. ATTENTE : On dort jusqu'à ce que update_top_10_events() nous réveille
+        // On attend l'ordre de sauvegarde
         osSemaphoreWait(h_StorageSemaphore, osWaitForever);
 
-        // 3. ACTION : Sauvegarde lente en SPI
-        log_to_uart("STORAGE: Saving to FRAM...");
-
         osMutexWait(h_Top10Mutex, osWaitForever);
-        Save_Top10_To_FRAM(); // Fonction définie plus haut
+
+        // Ecriture physique
+        FRAM_Write(FRAM_STORAGE_ADDR, (uint8_t*)g_top_10_events, sizeof(g_top_10_events));
+        FRAM_Write(FRAM_STORAGE_ADDR + sizeof(g_top_10_events), (uint8_t*)&g_events_count, 4);
+
+        // --- MODIFICATION ICI : On n'affiche qu'une seule ligne compacte ---
+        // Cela évite de saturer le buffer UART
+        if(g_events_count > 0) {
+                    int last = g_events_count - 1;
+                    log_to_uart("[SAVED] %s | X:%.2f Y:%.2f Z:%.2f",
+                                g_top_10_events[last].source_id,
+                                g_top_10_events[last].x,
+                                g_top_10_events[last].y,
+                                g_top_10_events[last].z);
+                }
+        // ------------------------------------------------------------------
+
         osMutexRelease(h_Top10Mutex);
     }
 }
 
+/* ======================= task Fram ======================= */
 
 
 
 
-
-
-// --- GESTION DU TEMPS SYSTEME ---
 #include <sys/time.h>
 
-// Variable globale pour stocker la différence entre l'heure NTP et le Tick système
 static time_t g_time_offset = 0;
 
 // Appelée par "time(NULL)"
@@ -1624,7 +1875,6 @@ int _settimeofday(const struct timeval *tv, const struct timezone *tz)
 
 
 
-/* --- Placeholder Tasks (Boucles vides) --- */
 
 
 
